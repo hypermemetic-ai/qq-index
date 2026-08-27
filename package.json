@@ -1,0 +1,19 @@
+{
+  "name": "@hypermemetic-ai/qq-wiki",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded architect orientation wikis for Git repositories.",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src/",
+    "prompts/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node tests/*.mjs"
+  }
+}
