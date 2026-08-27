@@ -14,9 +14,11 @@ current source and tests. It is a read-heavy ownership-discovery pass for
   satisfy.
 - The packet is repository-neutral; the target repository owns the resulting
   `wiki/` content.
-- qq-workflows owns the three-times-daily program: isolated worktree, optional
-  model pass, validation, path check, and mechanical wiki commit. It also owns
-  architect-only index injection; the writer is not an injection audience.
+- This package owns the unattended writer program: isolated worktree,
+  optional model pass, validation, path check, and mechanical wiki commit.
+- qq-workflows owns architect attach injection only; Mini and QA do not receive
+  the index, and the writer is not an injection audience. A timer that invokes
+  the program is neither a workflow nor owned by qq-workflows.
 
 ## Invariants
 

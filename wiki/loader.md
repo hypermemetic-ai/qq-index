@@ -12,8 +12,10 @@ that every local page route resolves to a regular file physically contained in
 - [Orientation convention](convention.md) defines why the cap and routing shape
   exist.
 - [Writer replay](writer.md) produces indexes that satisfy this boundary.
-- qq-workflows owns architect-only attach injection and the unattended refresh
-  program; this repository supplies their loader and packet boundaries.
+- qq-workflows owns architect attach injection only; Mini and QA do not
+  receive the index. This package owns the loader, packet, and unattended
+  writer program; a timer that invokes it is neither a workflow nor owned by
+  qq-workflows.
 
 ## Invariants
 
