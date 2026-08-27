@@ -14,26 +14,30 @@ current source and tests. It is a read-heavy ownership-discovery pass for
   satisfy.
 - The packet is repository-neutral; the target repository owns the resulting
   `wiki/` content.
-- qq-workflows owns the writer preset and three-times-daily runner. The writer,
-  like the architect, receives the current index as context; Mini and QA do not.
+- qq-workflows owns the three-times-daily program: isolated worktree, optional
+  model pass, validation, path check, and mechanical wiki commit. It also owns
+  architect-only index injection; the writer is not an injection audience.
 
 ## Invariants
 
 - Mapping is read-only and comes first. Source, tests, and focused history name
   semantic ownership before any page is written or split.
-- An injected index is only a potentially stale hint. Source wins, and wrong
+- The inner model pass reads `wiki/index.md` from the target tree when it
+  exists and treats it only as a potentially stale hint. Source wins, and wrong
   pages are deleted rather than padded, preserved for history, or filled with
   invented claims.
 - Accurate page content produces no page diff, but every run sets
   `Refreshed: <ISO 8601 UTC>` immediately after the index title. A stamp-only
   diff is success.
 - The stamp counts toward the 10,000 Unicode-code-point index cap.
-- The writer touches only regular files under `wiki/`, including when
-  restructuring pages, and never commits or pushes.
+- The inner model pass writes only under `wiki/` and never commits or pushes.
+  The wrapping program publishes mechanically only after `validateWiki` and a
+  wiki-only regular-file path check pass.
 - Native `read`, `grep`, and `glob` are the discovery interface. `bash` is for
   focused history, diff, and validation; edit and write stay under `wiki/`.
-- The output preserves the required headings and one-to-two-page normal route,
-  then passes `validateWiki(repoRoot)` and a wiki-only path check.
+- The writer is an unattended program, not a session or workflow step; an
+  operator neither triggers it nor waits for it.
+- The output preserves the required headings and one-to-two-page normal route.
 
 ## Look in
 
