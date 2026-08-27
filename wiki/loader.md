@@ -13,12 +13,17 @@ that every local page route resolves to a regular file physically contained in
   exist.
 - [Writer replay](writer.md) produces indexes that satisfy this boundary.
 - qq-workflows is the outbound injection owner; this repository does not decide
-  which sessions receive context.
+  which sessions receive context or run refreshes.
 
 ## Invariants
 
 - `loadIndex(repoRoot)` returns an empty string when `wiki/` or its index is
-  absent, and never reads an index over 4 KiB or 80 physical lines.
+  absent, and rejects an index over 10,000 Unicode code points.
+- The cap is measured by iterating the decoded string. Multibyte and astral
+  characters each count as one code point; bytes and physical lines are not
+  separate limits.
+- A `Refreshed: <ISO 8601 UTC>` line is ordinary index content and counts
+  toward the same cap.
 - `validateWiki(repoRoot)` accepts a completely absent wiki. A present wiki has
   an index and valid local routes.
 - `wiki/`, its index, and linked pages cross the boundary only as real
@@ -27,19 +32,19 @@ that every local page route resolves to a regular file physically contained in
 - Relative routes cannot escape lexically, by URL encoding, or through a
   symbolic-link ancestor. URL and fragment-only destinations are not local
   page routes.
-- Limits are measured in bytes before UTF-8 decoding and in physical lines,
-  including a final line without a newline.
 
 ## Look in
 
-- `src/index.mjs` — `loadIndex`, `validateWiki`, cap constants, and containment.
-- `tests/index.mjs` — missing, exact-cap, oversized, line, broken-link, escape,
-  and real-wiki cases.
+- `src/index.mjs` — `loadIndex`, `validateWiki`, `INDEX_MAX_CHARS`, and
+  containment.
+- `tests/index.mjs` — missing, code-point cap, stamp, broken-link, escape, and
+  real-wiki cases.
 - `package.json` — public ESM export and test command.
 
 ## Traps
 
-- Character count is not byte count for a prompt budget.
+- JavaScript `String#length` counts UTF-16 code units, not Unicode code points.
+- UTF-8 file size cannot stand in for a code-point prompt budget.
 - A lexical `wiki/` prefix alone does not stop a link traversing a symbolic
   directory.
 - A missing wiki is optional context; a malformed present wiki is not silently

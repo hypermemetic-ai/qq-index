@@ -26,6 +26,14 @@ Every page uses these headings and stays scannable (aim for at most 150 lines):
 4. Look in
 5. Traps
 
-`wiki/index.md` is capped at 4 KiB and about 80 lines. Each index entry is a
-path plus when to read it. A missing wiki contributes no context. When the wiki
-and the repository disagree, source wins.
+`wiki/index.md` is capped at 10,000 Unicode code points. Each index entry is a
+path plus when to read it. A writer refresh always puts
+`Refreshed: <ISO 8601 UTC>` immediately after the index title; that line counts
+toward the cap. A missing wiki contributes no context. When the wiki and the
+repository disagree, source wins.
+
+`prompts/writer.md` is the frozen writer packet. qq-workflows owns index
+injection and the three-times-daily refresh runner: architect and wiki-writer
+sessions receive the index, while Mini and QA sessions do not. This package
+owns the loader, validation, convention, and packet; each repository owns its
+own `wiki/` content.

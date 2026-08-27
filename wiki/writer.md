@@ -3,8 +3,8 @@
 ## What it is
 
 The frozen writer packet refreshes a repository's architect orientation from
-current source and tests. It is a constrained maintenance pass, not a request
-to document everything.
+current source and tests. It is a read-heavy ownership-discovery pass for
+`gpt-5.6-sol` at `xhigh`, not a request to document everything.
 
 ## Sits with
 
@@ -14,31 +14,41 @@ to document everything.
   satisfy.
 - The packet is repository-neutral; the target repository owns the resulting
   `wiki/` content.
+- qq-workflows owns the writer preset and three-times-daily runner. The writer,
+  like the architect, receives the current index as context; Mini and QA do not.
 
 ## Invariants
 
-- The writer discovers semantic ownership before choosing page boundaries and
-  never mirrors the source tree by default.
-- Only stale orientation changes. An accurate wiki produces no diff.
-- Wrong pages are deleted rather than padded, preserved for history, or filled
-  with invented claims.
-- Every semantic assertion is grounded in source or tests.
-- The writer touches only `wiki/`, including when restructuring pages.
-- The output preserves the required headings, index caps, and one-to-two-page
-  normal route.
+- Mapping is read-only and comes first. Source, tests, and focused history name
+  semantic ownership before any page is written or split.
+- An injected index is only a potentially stale hint. Source wins, and wrong
+  pages are deleted rather than padded, preserved for history, or filled with
+  invented claims.
+- Accurate page content produces no page diff, but every run sets
+  `Refreshed: <ISO 8601 UTC>` immediately after the index title. A stamp-only
+  diff is success.
+- The stamp counts toward the 10,000 Unicode-code-point index cap.
+- The writer touches only regular files under `wiki/`, including when
+  restructuring pages, and never commits or pushes.
+- Native `read`, `grep`, and `glob` are the discovery interface. `bash` is for
+  focused history, diff, and validation; edit and write stay under `wiki/`.
+- The output preserves the required headings and one-to-two-page normal route,
+  then passes `validateWiki(repoRoot)` and a wiki-only path check.
 
 ## Look in
 
-- `prompts/writer.md` — the replay packet and edit boundary.
+- `prompts/writer.md` — model, tools, forced phases, stamp, and edit boundary.
 - `README.md` — the convention the packet must preserve.
 - `wiki/convention.md` — local planning orientation for page rules.
+- `tests/index.mjs` — mechanical stamp and cap coverage.
 - `tests/corpus.mjs` — pressure against encyclopedia drift.
 
 ## Traps
 
+- Reading the tree and summarizing it is not ownership discovery.
 - Updating package metadata or source while “helpfully” refreshing the wiki
   violates the replay boundary.
 - Keeping a stale page with disclaimers is worse than deleting it.
 - Inventing an invariant to make a sparse page look useful corrupts future
   plans.
-- An empty diff is a successful replay when source has not falsified the map.
+- Page no-op does not skip the required refresh stamp.
