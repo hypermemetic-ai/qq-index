@@ -11,9 +11,10 @@ remain authoritative.
 
 - [Writer replay](writer.md) applies this convention in another repository.
 - [Index loader](loader.md) enforces the mechanical index boundary.
-- qq-workflows owns architect-only attach injection and the unattended
-  refresh program; Mini and QA are later, non-injected steps in the architect
-  workflow, and the writer is not a session or workflow step.
+- qq-workflows owns architect attach injection only; Mini and QA are later,
+  non-injected steps in the architect workflow. This package owns the
+  unattended writer program; a timer that invokes it is neither a workflow nor
+  owned by qq-workflows.
 
 ## Invariants
 

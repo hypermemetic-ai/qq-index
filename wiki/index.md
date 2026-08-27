@@ -13,6 +13,6 @@ needed for the job.
 
 Outbound joints:
 
-- qq-workflows owns architect-only attach injection and the unattended
-  three-times-daily writer program; Mini and QA do not receive the index, and
-  the writer is not a session or workflow step.
+- qq-workflows owns architect attach injection only; Mini and QA do not
+  receive the index. This package owns the unattended writer program; a timer
+  that invokes it is neither a workflow nor owned by qq-workflows.
