@@ -1,16 +1,12 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-export const INDEX_MAX_BYTES = 4 * 1024;
-export const INDEX_MAX_LINES = 80;
-// Readable aliases for consumers that phrase the limit as a cap.
-export const MAX_INDEX_BYTES = INDEX_MAX_BYTES;
-export const MAX_INDEX_LINES = INDEX_MAX_LINES;
+export const INDEX_MAX_CHARS = 10_000;
 
-function physicalLineCount(text) {
-  if (text.length === 0) return 0;
-  const breaks = text.match(/\r\n|[\r\n]/g)?.length ?? 0;
-  return breaks + (/[\r\n]$/.test(text) ? 0 : 1);
+function unicodeCodePointCount(text) {
+  let count = 0;
+  for (const _codePoint of text) count += 1;
+  return count;
 }
 
 function lstatIfPresent(path) {
@@ -47,18 +43,9 @@ function inspectWiki(repoRoot) {
 export function loadIndex(repoRoot) {
   const { index, wikiStat, indexStat } = inspectWiki(repoRoot);
   if (wikiStat === null || indexStat === null) return "";
-  if (indexStat.size > INDEX_MAX_BYTES) {
-    throw new Error(`qq-wiki: wiki/index.md exceeds ${INDEX_MAX_BYTES} bytes`);
-  }
-
-  const bytes = readFileSync(index);
-  if (bytes.byteLength > INDEX_MAX_BYTES) {
-    throw new Error(`qq-wiki: wiki/index.md exceeds ${INDEX_MAX_BYTES} bytes`);
-  }
-  const text = bytes.toString("utf8");
-  const lines = physicalLineCount(text);
-  if (lines > INDEX_MAX_LINES) {
-    throw new Error(`qq-wiki: wiki/index.md exceeds ${INDEX_MAX_LINES} lines`);
+  const text = readFileSync(index, "utf8");
+  if (unicodeCodePointCount(text) > INDEX_MAX_CHARS) {
+    throw new Error(`qq-wiki: wiki/index.md exceeds ${INDEX_MAX_CHARS} Unicode code points`);
   }
   return text;
 }

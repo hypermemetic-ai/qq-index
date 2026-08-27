@@ -3,8 +3,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import {
-  INDEX_MAX_BYTES,
-  INDEX_MAX_LINES,
+  INDEX_MAX_CHARS,
   loadIndex,
   validateWiki,
 } from "../src/index.mjs";
@@ -27,29 +26,42 @@ try {
   assert.equal(loadIndex(missing), "");
   assert.equal(validateWiki(missing), true);
 
+  assert.equal(INDEX_MAX_CHARS, 10_000);
+
   const exactCap = await temporaryRepo();
-  await put(exactCap, "wiki/index.md", "x".repeat(INDEX_MAX_BYTES));
-  assert.equal(loadIndex(exactCap).length, INDEX_MAX_BYTES);
+  await put(exactCap, "wiki/index.md", "x".repeat(INDEX_MAX_CHARS));
+  assert.equal([...loadIndex(exactCap)].length, INDEX_MAX_CHARS);
   assert.equal(validateWiki(exactCap), true);
 
   const oversized = await temporaryRepo();
-  await put(oversized, "wiki/index.md", "x".repeat(INDEX_MAX_BYTES + 1));
-  assert.throws(() => loadIndex(oversized), /exceeds 4096 bytes/);
-  assert.throws(() => validateWiki(oversized), /exceeds 4096 bytes/);
+  await put(oversized, "wiki/index.md", "x".repeat(INDEX_MAX_CHARS + 1));
+  assert.throws(() => loadIndex(oversized), /exceeds 10000 Unicode code points/);
+  assert.throws(() => validateWiki(oversized), /exceeds 10000 Unicode code points/);
 
-  const multibyte = await temporaryRepo();
-  await put(multibyte, "wiki/index.md", "é".repeat(INDEX_MAX_BYTES / 2));
-  assert.equal(Buffer.byteLength(loadIndex(multibyte)), INDEX_MAX_BYTES);
-  await put(multibyte, "wiki/index.md", `${"é".repeat(INDEX_MAX_BYTES / 2)}x`);
-  assert.throws(() => loadIndex(multibyte), /exceeds 4096 bytes/);
+  const unicodeAtCap = await temporaryRepo();
+  const unicodeIndex = `${"é".repeat(INDEX_MAX_CHARS - 1)}😀`;
+  assert.equal([...unicodeIndex].length, INDEX_MAX_CHARS);
+  assert.ok(Buffer.byteLength(unicodeIndex) > INDEX_MAX_CHARS);
+  await put(unicodeAtCap, "wiki/index.md", unicodeIndex);
+  assert.equal(loadIndex(unicodeAtCap), unicodeIndex);
+  assert.equal(validateWiki(unicodeAtCap), true);
+  await put(unicodeAtCap, "wiki/index.md", `${unicodeIndex}x`);
+  assert.throws(() => loadIndex(unicodeAtCap), /exceeds 10000 Unicode code points/);
 
-  const exactLines = await temporaryRepo();
-  await put(exactLines, "wiki/index.md", "x\n".repeat(INDEX_MAX_LINES));
-  assert.equal(validateWiki(exactLines), true);
+  const manyLines = await temporaryRepo();
+  await put(manyLines, "wiki/index.md", "x\n".repeat(1_000));
+  assert.equal(validateWiki(manyLines), true);
 
-  const tooManyLines = await temporaryRepo();
-  await put(tooManyLines, "wiki/index.md", `${"x\n".repeat(INDEX_MAX_LINES)}x\n`);
-  assert.throws(() => loadIndex(tooManyLines), /exceeds 80 lines/);
+  const stamped = await temporaryRepo();
+  const stampedHeader = "# Orientation\nRefreshed: 2026-08-27T16:28:00Z\n\n";
+  const stampedAtCap = `${stampedHeader}${"x".repeat(
+    INDEX_MAX_CHARS - [...stampedHeader].length,
+  )}`;
+  await put(stamped, "wiki/index.md", stampedAtCap);
+  assert.equal([...loadIndex(stamped)].length, INDEX_MAX_CHARS);
+  assert.equal(validateWiki(stamped), true);
+  await put(stamped, "wiki/index.md", `${stampedAtCap}x`);
+  assert.throws(() => validateWiki(stamped), /exceeds 10000 Unicode code points/);
 
   const broken = await temporaryRepo();
   await put(broken, "wiki/index.md", "- [Missing](missing.md)\n");

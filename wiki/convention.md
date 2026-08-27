@@ -11,8 +11,8 @@ remain authoritative.
 
 - [Writer replay](writer.md) applies this convention in another repository.
 - [Index loader](loader.md) enforces the mechanical index boundary.
-- qq-workflows is the outbound consumer that decides when architect context is
-  attached.
+- qq-workflows owns architect and wiki-writer injection and the
+  three-times-daily refresh runner; Mini and QA are not index audiences.
 
 ## Invariants
 
@@ -25,8 +25,12 @@ remain authoritative.
   specific justification; four means the map is too fine.
 - Every page uses `What it is`, `Sits with`, `Invariants`, `Look in`, and
   `Traps`, and aims to remain within 150 lines.
-- The index remains at most 4 KiB and 80 lines. No wiki means no orientation
-  context. Source wins every disagreement.
+- The index remains at most 10,000 Unicode code points. It has no byte or line
+  cap.
+- Every writer run places `Refreshed: <ISO 8601 UTC>` immediately after the
+  index title. The stamp counts toward the code-point cap, and a stamp-only
+  diff is a successful refresh.
+- No wiki means no orientation context. Source wins every disagreement.
 
 ## Look in
 
@@ -42,3 +46,4 @@ remain authoritative.
 - A broad overview page should not duplicate internals from every sibling.
 - Signal files identify good re-entry points; they do not prove complete
   ownership or supersede source inspection.
+- A UTF-16 string length or UTF-8 byte count is not a Unicode code-point count.
