@@ -12,8 +12,8 @@ that every local page route resolves to a regular file physically contained in
 - [Orientation convention](convention.md) defines why the cap and routing shape
   exist.
 - [Writer replay](writer.md) produces indexes that satisfy this boundary.
-- qq-workflows is the outbound injection owner; this repository does not decide
-  which sessions receive context or run refreshes.
+- qq-workflows owns architect-only attach injection and the unattended refresh
+  program; this repository supplies their loader and packet boundaries.
 
 ## Invariants
 
@@ -49,5 +49,4 @@ that every local page route resolves to a regular file physically contained in
   directory.
 - A missing wiki is optional context; a malformed present wiki is not silently
   ignored by validation.
-- Context injection and audience policy belong to qq-workflows, not this
-  loader.
+- Architect attach policy belongs to qq-workflows, not this loader.

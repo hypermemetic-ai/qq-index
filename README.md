@@ -32,8 +32,12 @@ path plus when to read it. A writer refresh always puts
 toward the cap. A missing wiki contributes no context. When the wiki and the
 repository disagree, source wins.
 
-`prompts/writer.md` is the frozen writer packet. qq-workflows owns index
-injection and the three-times-daily refresh runner: architect and wiki-writer
-sessions receive the index, while Mini and QA sessions do not. This package
-owns the loader, validation, convention, and packet; each repository owns its
-own `wiki/` content.
+`prompts/writer.md` is the frozen writer packet. qq-workflows owns architect
+attach injection and the three-times-daily refresh program. Only the architect
+function receives the index; Mini and QA are later steps in that same
+operator-triggered workflow and do not receive it. The writer is an unattended
+program,
+not a session or workflow step: its wrapper runs an optional model pass in an
+isolated worktree, validates, and mechanically publishes. This package owns the
+loader, validation, convention, and packet; each repository owns its own
+`wiki/` content.

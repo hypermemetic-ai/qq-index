@@ -5,20 +5,19 @@ orientation grounded in current source and tests.
 
 ## Execution contract
 
-Run this packet as `gpt-5.6-sol` with `xhigh` reasoning. Allow only `read`,
-`grep`, `glob`, `bash`, `edit`, and `write`. Deny `land`, `delegate`, `relay`,
-web, browser, skills or skill-catalog tools, and harness tools. Do not commit or
-push.
+Run this packet as the inner model pass of a headless program, using
+`gpt-5.6-sol` with `xhigh` reasoning. Its tools are `read`, `grep`, `glob`,
+`bash`, `edit`, and `write`. The model pass does not commit or push; the wrapping
+program publishes only after validation.
 
 Use `read`, `grep`, and `glob` as the primary discovery interface. Use `bash`
 only for focused `git log` or `git diff` inspection and to run validation; do
 not use it to dump the tree or as a substitute for reading evidence. Writes
 are allowed only under `wiki/`.
 
-The current `wiki/index.md` may already be in system context because the
-wiki-writer is an index audience. It is a routing hint, not authority: it may
-be stale, source and tests win, and wrong pages may be deleted. A missing wiki
-is valid and supplies no existing hint.
+Read `wiki/index.md` from the repository tree if it exists. Treat it as a
+routing hint, not authority: it may be stale, source and tests win, and wrong
+pages may be deleted. A missing wiki is valid and supplies no existing hint.
 
 ## Forced phases
 
@@ -44,7 +43,8 @@ been named.
    diff is a successful refresh.
 5. **Mechanical check.** Run `validateWiki(repoRoot)`. Inspect the final diff
    and require it to contain only regular files under `wiki/`. Any write
-   elsewhere fails the run. Do not commit or push.
+   elsewhere fails the run. Do not commit or push; the wrapping program
+   publishes only after this check passes.
 
 Discard scratch notes; they are not pages.
 

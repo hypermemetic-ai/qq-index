@@ -11,8 +11,9 @@ remain authoritative.
 
 - [Writer replay](writer.md) applies this convention in another repository.
 - [Index loader](loader.md) enforces the mechanical index boundary.
-- qq-workflows owns architect and wiki-writer injection and the
-  three-times-daily refresh runner; Mini and QA are not index audiences.
+- qq-workflows owns architect-only attach injection and the unattended
+  refresh program; Mini and QA are later, non-injected steps in the architect
+  workflow, and the writer is not a session or workflow step.
 
 ## Invariants
 

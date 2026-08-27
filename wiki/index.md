@@ -7,11 +7,12 @@ needed for the job.
   wiki means, how ownership boundaries split or merge, or the index form and
   refresh-stamp convention.
 - [`writer.md`](writer.md) — read when changing the writer model, tools, forced
-  phases, audience assumptions, edit limits, or page no-op behavior.
+  phases, program boundary, edit limits, or page no-op behavior.
 - [`loader.md`](loader.md) — read when changing code-point caps, index loading,
   link validation, containment, exports, or loader tests.
 
 Outbound joints:
 
-- qq-workflows owns architect and wiki-writer index injection and the
-  three-times-daily refresh runner; Mini and QA are not index audiences.
+- qq-workflows owns architect-only attach injection and the unattended
+  three-times-daily writer program; Mini and QA do not receive the index, and
+  the writer is not a session or workflow step.
