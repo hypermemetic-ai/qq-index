@@ -40,3 +40,10 @@ program: its wrapper runs an optional model pass in an isolated worktree,
 validates, and mechanically publishes. The writer is not a session or workflow
 step, and a timer that invokes it is neither a workflow nor owned by
 qq-workflows. Each repository owns its own `wiki/` content.
+
+The refresh program lives in `src/refresh.mjs` and `bin/qq-wiki-refresh`; its
+headless model binding is planned and spawned by `src/model-pass.mjs` using the
+package-owned `config/writer.patch.yml`. `config/repositories` is the bounded
+first-wave registry, and the shipped user timer invokes the program directly.
+The timer is not an operator workflow. Tests use temporary repositories and
+stub the model pass in `tests/refresh.mjs`.

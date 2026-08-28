@@ -42,7 +42,7 @@ for (const job of jobs) {
   }
 }
 
-// `node tests/*.mjs` executes the first glob match and passes the rest as
-// arguments, so the first suite explicitly loads the second one.
+// The corpus suite explicitly loads the loader suite; package.json then runs
+// the refresh-program integration suite as a separate process.
 console.log("corpus fixtures: ok");
 await import("./index.mjs");

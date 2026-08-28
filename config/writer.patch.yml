@@ -1,0 +1,73 @@
+# qq-wiki's headless writer overlay. The wrapper supplies the frozen packet and
+# absolute qq-models package path in the environment.
+
+- id: system-prompt
+  config:
+    persona: !!js process.env.QQ_WIKI_WRITER_PROMPT
+
+- id: agent-default-model
+  config:
+    provider: !!js process.env.QQ_DSH_PROVIDER
+    model: !!js process.env.QQ_DSH_MODEL
+
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()
+
+- id: approval
+  config:
+    policy: never
+
+- id: permission
+  disabled: true
+
+- id: tools
+  config:
+    mode: native
+
+# The filesystem suite registers read/write/edit. With attachments absent it
+# does not register read_image. Search registers grep/glob; bash is separate.
+- id: attachment-local
+  disabled: true
+- id: agent-instructions
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: code-runtime
+  disabled: true
+
+# Deny every model-facing tool bundle other than tool-fs, tool-fs-search, and
+# tool-bash. Domain services may remain mounted but expose no extra tool.
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-report
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-todo
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: tool-str-replace-editor
+  disabled: true
+- id: tool-web
+  disabled: true
+
+- insert:
+    - id: qq-wiki-models
+      name: !!js process.env.QQ_WIKI_MODELS_ROOT

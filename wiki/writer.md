@@ -44,6 +44,12 @@ current source and tests. It is a read-heavy ownership-discovery pass for
 ## Look in
 
 - `prompts/writer.md` — model, tools, forced phases, stamp, and edit boundary.
+- `src/model-pass.mjs` and `config/writer.patch.yml` — exact headless DSH plan,
+  model binding, tool boundary, and qq-models resolution.
+- `src/refresh.mjs` and `bin/qq-wiki-refresh` — lock, isolated clone, path
+  checks, bot commit, fast-forward publication, registry entry point.
+- `tests/refresh.mjs` — temporary-Git coverage for both paths and failure
+  fences.
 - `README.md` — the convention the packet must preserve.
 - `wiki/convention.md` — local planning orientation for page rules.
 - `tests/index.mjs` — mechanical stamp and cap coverage.
