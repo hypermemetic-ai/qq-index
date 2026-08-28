@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh architect orientation wikis
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/qq-wiki
+UMask=0077
+Environment="PATH=%h/.local/bin:%h/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=%h/projects/qq-wiki/bin/qq-wiki-refresh
+TimeoutStartSec=12h

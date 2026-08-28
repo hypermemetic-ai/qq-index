@@ -9,11 +9,17 @@
     ".": "./src/index.mjs"
   },
   "files": [
+    "bin/",
+    "config/",
+    "systemd/",
     "src/",
     "prompts/",
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/*.mjs"
+    "test": "node tests/corpus.mjs && node tests/refresh.mjs"
+  },
+  "bin": {
+    "qq-wiki-refresh": "bin/qq-wiki-refresh"
   }
 }
