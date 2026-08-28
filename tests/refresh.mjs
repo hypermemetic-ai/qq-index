@@ -310,10 +310,16 @@ try {
     assert.equal(plan.env.DSH_HOME, process.env.DSH_HOME);
     assert.match(plan.env.QQ_WIKI_WRITER_PROMPT, /Forced phases/);
     assert.match(plan.env.QQ_WIKI_MODELS_ROOT, /qq-models$/);
+    assert.match(plan.pluginHref, /\/src\/plugin\.mjs$/);
+    assert.match(plan.overlaySource, /name: "file:\/\/.*\/src\/plugin\.mjs"/);
+    assert.equal(plan.overlaySource.includes("!!js process.env.QQ_WIKI_MODELS_ROOT"), false);
+    assert.equal(plan.overlaySource.includes("__QQ_WIKI_MODELS_ROOT__"), false);
     const overlay = await readFile(resolve(repositoryRoot, "config/writer.patch.yml"), "utf8");
     assert.match(overlay, /id: approval\n  config:\n    policy: never/);
     assert.match(overlay, /id: agent-instructions\n  disabled: true/);
     assert.match(overlay, /id: tool-subagent\n  disabled: true/);
+    assert.match(overlay, /name: __QQ_WIKI_MODELS_ROOT__/);
+    assert.equal(overlay.includes("!!js process.env.QQ_WIKI_MODELS_ROOT"), false);
   }
 
   console.log("refresh program: ok");

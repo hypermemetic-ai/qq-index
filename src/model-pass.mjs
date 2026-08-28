@@ -1,10 +1,13 @@
-import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { accessSync, constants as fsConstants, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WRITER_TASK = "Refresh this repository's architect orientation wiki.";
+export const MODELS_NAME_TOKEN = "__QQ_WIKI_MODELS_ROOT__";
 
 function requirePath(path, label, mode = fsConstants.F_OK) {
   try {
@@ -71,6 +74,20 @@ function resolveModels(env, root) {
   return path;
 }
 
+function resolvePluginHref(modelsRoot) {
+  const plugin = requirePath(resolve(modelsRoot, "src/plugin.mjs"), "qq-models plugin");
+  return pathToFileURL(plugin).href;
+}
+
+/** Inline the qq-models plugin specifier. DSH imports entry `name` before !!js. */
+export function resolveWriterOverlay(template, pluginHref) {
+  const needle = `name: ${MODELS_NAME_TOKEN}`;
+  if (!template.includes(needle)) {
+    throw new Error("qq-wiki: writer overlay is missing the qq-models name token");
+  }
+  return template.replaceAll(needle, `name: ${JSON.stringify(pluginHref)}`);
+}
+
 /** Build the exact headless DSH invocation without spawning it. */
 export function modelPassPlan(cloneRoot, options = {}) {
   const env = { ...process.env, ...(options.env ?? {}) };
@@ -80,10 +97,14 @@ export function modelPassPlan(cloneRoot, options = {}) {
   const overlay = resolve(root, "config/writer.patch.yml");
   requirePath(overlay, "writer overlay");
   const prompt = readFileSync(resolve(root, "prompts/writer.md"), "utf8");
+  const pluginHref = resolvePluginHref(modelsRoot);
+  const overlaySource = resolveWriterOverlay(readFileSync(overlay, "utf8"), pluginHref);
 
   return {
     command,
     args: ["--profile", "headless", "--patch", overlay, WRITER_TASK],
+    overlaySource,
+    pluginHref,
     cwd: resolve(cloneRoot),
     env: {
       ...env,
@@ -112,10 +133,17 @@ function waitForChild(child) {
 /** Run the unattended inner writer pass. It never commits or publishes. */
 export async function runModelPass(cloneRoot, options = {}) {
   const plan = modelPassPlan(cloneRoot, options);
-  const child = spawn(plan.command, plan.args, {
-    cwd: plan.cwd,
-    env: plan.env,
-    stdio: "inherit",
-  });
-  await waitForChild(child);
+  const overlayPath = join(tmpdir(), `qq-wiki-writer-${randomUUID()}.patch.yml`);
+  writeFileSync(overlayPath, plan.overlaySource, { encoding: "utf8", mode: 0o600 });
+  const args = ["--profile", "headless", "--patch", overlayPath, WRITER_TASK];
+  try {
+    const child = spawn(plan.command, args, {
+      cwd: plan.cwd,
+      env: plan.env,
+      stdio: "inherit",
+    });
+    await waitForChild(child);
+  } finally {
+    try { unlinkSync(overlayPath); } catch {}
+  }
 }
