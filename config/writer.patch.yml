@@ -1,5 +1,6 @@
-# qq-wiki's headless writer overlay. The wrapper supplies the frozen packet and
-# absolute qq-models package path in the environment.
+# qq-wiki's headless writer overlay. The wrapper supplies the frozen packet in
+# the environment. Plugin `name` is a token: DSH imports it before evaluating
+# !!js, so model-pass inlines a file: URL to qq-models/src/plugin.mjs.
 
 - id: system-prompt
   config:
@@ -70,4 +71,4 @@
 
 - insert:
     - id: qq-wiki-models
-      name: !!js process.env.QQ_WIKI_MODELS_ROOT
+      name: __QQ_WIKI_MODELS_ROOT__

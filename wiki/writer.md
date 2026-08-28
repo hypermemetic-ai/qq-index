@@ -64,3 +64,5 @@ current source and tests. It is a read-heavy ownership-discovery pass for
 - Inventing an invariant to make a sparse page look useful corrupts future
   plans.
 - Page no-op does not skip the required refresh stamp.
+- DSH imports plugin `name` before evaluating `!!js`. The wrapper inlines a
+  `file:` URL to `qq-models/src/plugin.mjs`; do not put `!!js` on `name`.
