@@ -1,4 +1,5 @@
 # qq-wiki orientation
+Refreshed: 2026-08-28T18:40:58.678Z
 
 Source and tests are authoritative. Route from here to the ownership boundary
 needed for the job.
