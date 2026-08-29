@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Bounded repository orientation in README.md.",
-  "main": "src/index.mjs",
+  "main": "src/plugin.mjs",
   "exports": {
-    ".": "./src/index.mjs"
+    ".": "./src/plugin.mjs"
   },
   "files": [
     "bin/",
@@ -17,7 +17,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/index.mjs && node tests/harvest.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
+    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
   },
   "bin": {
     "qq-index-refresh": "bin/qq-index-refresh"
