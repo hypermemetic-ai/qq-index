@@ -4,9 +4,26 @@ import { pathToFileURL } from "node:url";
 export const name = "qq-wiki-writer-boot";
 export const inject = ["agents"];
 
+const NOOP_CORE = Object.freeze({
+  surface: Object.freeze({
+    allow() {},
+  }),
+});
+
 function agentsOf(ctx) {
   const host = ctx?.root && typeof ctx.root.get === "function" ? ctx.root : ctx;
   return host?.get?.("agents", false) ?? ctx?.agents ?? ctx?.get?.("agents", false) ?? null;
+}
+
+function ensureCoreSurface(agentCtx) {
+  if (!agentCtx || typeof agentCtx.get !== "function") {
+    throw new Error("qq-wiki writer boot requires an agent Cordis context");
+  }
+  if (agentCtx.get("qq-core", false) !== undefined) return;
+  if (typeof agentCtx.provide !== "function") {
+    throw new Error("qq-wiki writer boot requires agentCtx.provide");
+  }
+  agentCtx.provide("qq-core", NOOP_CORE);
 }
 
 async function miniDocsSetupFor(env) {
@@ -35,7 +52,10 @@ export async function apply(ctx, config = {}) {
   const env = config.env ?? process.env;
   const miniDocsSetup = await miniDocsSetupFor(env);
   const mount = (agent) => {
-    if (agent) miniDocsSetup(agent?.ctx ?? agent, { env });
+    if (!agent) return;
+    const agentCtx = agent?.ctx ?? agent;
+    ensureCoreSurface(agentCtx);
+    miniDocsSetup(agentCtx, { env });
   };
 
   ctx.on("agent/created", ({ agent } = {}) => mount(agent));
