@@ -17,7 +17,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/corpus.mjs && node tests/refresh.mjs"
+    "test": "node tests/corpus.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
   },
   "bin": {
     "qq-wiki-refresh": "bin/qq-wiki-refresh"

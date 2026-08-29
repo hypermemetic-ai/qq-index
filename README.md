@@ -32,18 +32,27 @@ path plus when to read it. A writer refresh always puts
 toward the cap. A missing wiki contributes no context. When the wiki and the
 repository disagree, source wins.
 
-`prompts/writer.md` is the frozen writer packet. qq-workflows owns architect
-attach injection only. The architect function receives the index; Mini and QA
-are later steps in that operator-triggered workflow and do not receive it. This
-package owns the loader, validation, convention, packet, and unattended writer
-program: its wrapper runs an optional model pass in an isolated worktree,
-validates, and mechanically publishes. The writer is not a session or workflow
-step, and a timer that invokes it is neither a workflow nor owned by
-qq-workflows. Each repository owns its own `wiki/` content.
+`prompts/writer.md` is the frozen bash-only writer packet. The inner headless
+pass loads qq-workflows' `qq-mini-docs` adapter, while a tiny qq-wiki boot plugin
+mounts that adapter on the headerless agent created by the headless runner. Mini
+Docs supplies the bounded observation window, bash wrapper, format retry, and
+exact completion sentinel. The inner pass never commits or invokes Land.
 
-The refresh program lives in `src/refresh.mjs` and `bin/qq-wiki-refresh`; its
-headless model binding is planned and spawned by `src/model-pass.mjs` using the
-package-owned `config/writer.patch.yml`. `config/repositories` is the bounded
-first-wave registry, and the shipped user timer invokes the program directly.
-The timer is not an operator workflow. Tests use temporary repositories and
-stub the model pass in `tests/refresh.mjs`.
+That writer pass is not the Mini implementer or QA child in an operator
+workflow. qq-workflows also owns architect index attachment, but the attachment
+audience remains the architect: Mini implementer and QA children still do not
+receive the index.
+
+This package owns the loader, validation, convention, packet, writer boot, and
+outer refresh program. The outer program runs the model in an isolated
+worktree, validates the result, checks the wiki-only path boundary, and still
+commits and publishes mechanically. Each repository owns its own `wiki/`
+content.
+
+The refresh program lives in `src/refresh.mjs` and `bin/qq-wiki-refresh`;
+`src/model-pass.mjs` resolves both qq-models and qq-workflows and spawns DSH with
+the package-owned `config/writer.patch.yml`. `config/repositories` is the
+bounded first-wave registry. The shipped user timer invokes the program
+directly: the timer is not an operator workflow and is not owned by
+qq-workflows. Tests use temporary repositories and stub the model pass in
+`tests/refresh.mjs`.

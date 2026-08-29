@@ -1,5 +1,5 @@
 # qq-wiki orientation
-Refreshed: 2026-08-28T18:40:58.678Z
+Refreshed: 2026-08-29T01:18:23.669Z
 
 Source and tests are authoritative. Route from here to the ownership boundary
 needed for the job.
@@ -14,6 +14,7 @@ needed for the job.
 
 Outbound joints:
 
-- qq-workflows owns architect attach injection only; Mini and QA do not
-  receive the index. This package owns the unattended writer program; a timer
-  that invokes it is neither a workflow nor owned by qq-workflows.
+- qq-workflows owns architect index attachment and the Mini Docs adapter used
+  by qq-wiki's inner writer pass. Workflow Mini implementer and QA children
+  still do not receive the index. qq-wiki still owns outer publication; its
+  direct timer is not a workflow.
