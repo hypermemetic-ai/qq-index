@@ -3,7 +3,6 @@ import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { parseCliArgs, parseRepositoryRegistry, repositoriesForCli, runCli } from "../src/cli.mjs";
@@ -394,10 +393,11 @@ try {
     assert.doesNotMatch(prompt, /^## Traps$/m);
 
     assert.match(plan.modelsPluginHref, /^file:\/\/.*\/qq-models\/src\/plugin\.mjs$/);
-    assert.match(plan.miniDocsPluginHref, /^file:\/\/.*\/qq-workflows\/src\/mini-docs\.mjs$/);
+    assert.equal("miniDocs" in plan.pluginHrefs, false);
+    assert.equal("miniDocsPluginHref" in plan, false);
     assert.match(plan.writerBootPluginHref, /^file:\/\/.*\/src\/writer-boot\.mjs$/);
     assert.match(plan.overlaySource, /id: qq-index-models\n      name: "file:\/\/.*\/src\/plugin\.mjs"/);
-    assert.match(plan.overlaySource, /id: qq-mini-docs\n      name: "file:\/\/.*\/src\/mini-docs\.mjs"/);
+    assert.doesNotMatch(plan.overlaySource, /qq-mini-docs|mini-docs\.mjs|MINI_DOCS/);
     assert.match(plan.overlaySource, /id: qq-index-writer-boot\n      name: "file:\/\/.*\/src\/writer-boot\.mjs"/);
     assert.equal(plan.overlaySource.includes("__QQ_INDEX_"), false);
 
@@ -406,7 +406,7 @@ try {
     assert.match(overlay, /id: tool-fs\n  disabled: true/);
     assert.match(overlay, /id: tool-fs-search\n  disabled: true/);
     assert.doesNotMatch(overlay, /id: tool-bash\n  disabled: true/);
-    assert.match(overlay, /id: qq-mini-docs\n      name: __QQ_INDEX_MINI_DOCS_PLUGIN__/);
+    assert.doesNotMatch(overlay, /qq-mini-docs|__QQ_INDEX_MINI_DOCS_PLUGIN__/);
     assert.match(overlay, /id: qq-index-writer-boot\n      name: __QQ_INDEX_WRITER_BOOT_PLUGIN__/);
   }
 
@@ -425,10 +425,8 @@ try {
       env: { QQ_INDEX_WORKFLOWS_ROOT: workflowsOverride },
     });
     assert.equal(plan.env.QQ_INDEX_WORKFLOWS_ROOT, workflowsOverride);
-    assert.equal(
-      plan.miniDocsPluginHref,
-      new URL("src/mini-docs.mjs", `${pathToFileURL(workflowsOverride).href}/`).href,
-    );
+    assert.match(plan.overlaySource, /id: qq-index-writer-boot/);
+    assert.doesNotMatch(plan.overlaySource, /qq-mini-docs|mini-docs\.mjs/);
   }
 
   console.log("refresh program: ok");

@@ -45,7 +45,5 @@
 - insert:
     - id: qq-index-models
       name: __QQ_INDEX_MODELS_ROOT__
-    - id: qq-mini-docs
-      name: __QQ_INDEX_MINI_DOCS_PLUGIN__
     - id: qq-index-writer-boot
       name: __QQ_INDEX_WRITER_BOOT_PLUGIN__

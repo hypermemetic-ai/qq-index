@@ -10,7 +10,6 @@ import { harvestRepository } from "./harvest.mjs";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WRITER_TASK = "Write this repository's README index from the supplied evidence packet.";
 export const MODELS_NAME_TOKEN = "__QQ_INDEX_MODELS_ROOT__";
-export const MINI_DOCS_NAME_TOKEN = "__QQ_INDEX_MINI_DOCS_PLUGIN__";
 export const WRITER_BOOT_NAME_TOKEN = "__QQ_INDEX_WRITER_BOOT_PLUGIN__";
 
 function requirePath(path, label, mode = fsConstants.F_OK) {
@@ -102,7 +101,6 @@ function resolvePluginHref(root, relativePath, label) {
 export function resolveWriterOverlay(template, pluginHrefs) {
   const replacements = [
     [MODELS_NAME_TOKEN, pluginHrefs.models, "qq-models"],
-    [MINI_DOCS_NAME_TOKEN, pluginHrefs.miniDocs, "qq-mini-docs"],
     [WRITER_BOOT_NAME_TOKEN, pluginHrefs.writerBoot, "qq-index writer boot"],
   ];
   let source = template;
@@ -133,7 +131,6 @@ export function modelPassPlan(cloneRoot, options = {}) {
   const prompt = `${contract}\n\n${evidencePacket.trimEnd()}\n`;
   const pluginHrefs = {
     models: resolvePluginHref(modelsRoot, "src/plugin.mjs", "qq-models plugin"),
-    miniDocs: resolvePluginHref(workflowsRoot, "src/mini-docs.mjs", "qq-workflows mini-docs plugin"),
     writerBoot: resolvePluginHref(root, "src/writer-boot.mjs", "qq-index writer boot plugin"),
   };
   const overlaySource = resolveWriterOverlay(readFileSync(overlay, "utf8"), pluginHrefs);
@@ -144,7 +141,6 @@ export function modelPassPlan(cloneRoot, options = {}) {
     overlaySource,
     pluginHrefs,
     modelsPluginHref: pluginHrefs.models,
-    miniDocsPluginHref: pluginHrefs.miniDocs,
     writerBootPluginHref: pluginHrefs.writerBoot,
     cwd: resolve(cloneRoot),
     env: {
