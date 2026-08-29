@@ -8,8 +8,7 @@ export const provide = "qq-index";
 
 const service = Object.freeze({ loadIndex, validateIndex });
 
-/** Provide repository-index access under the current and compatibility names. */
+/** Provide repository-index access through the canonical service name. */
 export function apply(ctx) {
   ctx.provide("qq-index", service);
-  ctx.provide("qq-wiki", service);
 }

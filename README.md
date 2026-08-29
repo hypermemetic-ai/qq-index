@@ -8,8 +8,8 @@ visible on GitHub, included as npm package documentation, and returned by
 ## Start here
 
 - [`src/plugin.mjs`](src/plugin.mjs) is the Cordis entry point. It provides the
-  same bounded loader service as `qq-index` and the compatibility name
-  `qq-wiki`, so hosts discover the package without coupling consumers to it.
+  bounded loader service as `qq-index`, so hosts discover the package without
+  coupling consumers to it.
 - [`src/index.mjs`](src/index.mjs) is the public synchronous boundary. It loads
   a README up to 10,000 Unicode code points and validates relative Markdown
   links without allowing links to escape the repository.
@@ -53,10 +53,9 @@ const orientation = loadIndex(repositoryRoot); // "" when README.md is absent
 validateIndex(repositoryRoot);                 // true or throws
 ```
 
-Cordis hosts load the package as a plugin and consumers resolve either service
-name through the host. `qq-index` and legacy `qq-wiki` expose the same frozen
-`{ loadIndex, validateIndex }` service; `qq-wiki` is a compatibility name, not a
-separate wiki-page product.
+Cordis hosts load the package as a plugin, and consumers resolve the `qq-index`
+service through the host. It exposes a frozen `{ loadIndex, validateIndex }`
+service.
 
 `validateIndex` ignores external URLs and in-document fragments. Every relative
 link and image must resolve to a regular file under the repository root;

@@ -21,10 +21,8 @@ plugin.apply({
   },
 });
 
-assert.deepEqual(registrations.map(({ name }) => name), ["qq-index", "qq-wiki"]);
+assert.deepEqual(registrations.map(({ name }) => name), ["qq-index"]);
 const indexService = registrations[0].service;
-const wikiService = registrations[1].service;
-assert.equal(indexService, wikiService, "compatibility name must expose the same service object");
 assert.equal(Object.isFrozen(indexService), true);
 assert.deepEqual(Object.keys(indexService).sort(), ["loadIndex", "validateIndex"]);
 assert.equal(indexService.loadIndex, plugin.loadIndex);
@@ -35,7 +33,7 @@ try {
   await writeFile(resolve(repository, "README.md"), "# Index\n\n[Package](package.json)\n");
   await writeFile(resolve(repository, "package.json"), "{}\n");
   assert.equal(indexService.loadIndex(repository), "# Index\n\n[Package](package.json)\n");
-  assert.equal(wikiService.validateIndex(repository), true);
+  assert.equal(indexService.validateIndex(repository), true);
 
   await writeFile(resolve(repository, "README.md"), "[Missing](missing.md)\n");
   assert.throws(() => indexService.validateIndex(repository), /not a regular file/);
