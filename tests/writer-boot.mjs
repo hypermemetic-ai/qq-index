@@ -3,8 +3,8 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 
-const root = await mkdtemp(resolve(tmpdir(), "qq-wiki-writer-boot-test-"));
-const callsKey = Symbol.for("qq.wiki.writerBootTestCalls");
+const root = await mkdtemp(resolve(tmpdir(), "qq-index-writer-boot-test-"));
+const callsKey = Symbol.for("qq.index.writerBootTestCalls");
 globalThis[callsKey] = [];
 
 function agentContext(id, initialServices = []) {
@@ -36,7 +36,7 @@ export function miniDocsSetup(agentCtx, { env }) {
     throw new Error("qq-core surface.allow is required");
   }
   qq.surface.allow(agentCtx.agent, ["bash"]);
-  globalThis[Symbol.for("qq.wiki.writerBootTestCalls")].push({ agentCtx, env, qq });
+  globalThis[Symbol.for("qq.index.writerBootTestCalls")].push({ agentCtx, env, qq });
 }
 `);
 
@@ -61,8 +61,8 @@ export function miniDocsSetup(agentCtx, { env }) {
 
   const listeners = [];
   const env = {
-    QQ_WIKI_WORKFLOWS_ROOT: root,
-    QQ_WIKI_WRITER_PROMPT: "writer packet",
+    QQ_INDEX_WORKFLOWS_ROOT: root,
+    QQ_INDEX_WRITER_PROMPT: "writer packet",
   };
   const ctx = {
     get(service) {

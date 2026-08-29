@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh architect orientation wikis three times daily
+Description=Refresh repository README indexes three times daily
 
 [Timer]
 OnCalendar=*-*-* 04:00:00
@@ -7,7 +7,7 @@ OnCalendar=*-*-* 12:00:00
 OnCalendar=*-*-* 20:00:00
 AccuracySec=1s
 Persistent=false
-Unit=qq-wiki.service
+Unit=qq-index.service
 
 [Install]
 WantedBy=timers.target

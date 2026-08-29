@@ -18,41 +18,30 @@ function lstatIfPresent(path) {
   }
 }
 
-function wikiPaths(repoRoot) {
+function inspectIndex(repoRoot) {
   const root = resolve(repoRoot);
-  const wiki = resolve(root, "wiki");
-  return { wiki, index: resolve(wiki, "index.md") };
-}
-
-function inspectWiki(repoRoot) {
-  const paths = wikiPaths(repoRoot);
-  const wikiStat = lstatIfPresent(paths.wiki);
-  if (wikiStat === null) return { ...paths, wikiStat, indexStat: null };
-  if (!wikiStat.isDirectory()) {
-    throw new Error("qq-wiki: wiki/ must be a directory");
-  }
-
-  const indexStat = lstatIfPresent(paths.index);
+  const index = resolve(root, "README.md");
+  const indexStat = lstatIfPresent(index);
   if (indexStat !== null && !indexStat.isFile()) {
-    throw new Error("qq-wiki: wiki/index.md must be a regular file");
+    throw new Error("qq-index: README.md must be a regular file");
   }
-  return { ...paths, wikiStat, indexStat };
+  return { root, index, indexStat };
 }
 
-/** Load the bounded orientation index, or an empty string when it is absent. */
+/** Load the bounded repository index, or an empty string when it is absent. */
 export function loadIndex(repoRoot) {
-  const { index, wikiStat, indexStat } = inspectWiki(repoRoot);
-  if (wikiStat === null || indexStat === null) return "";
+  const { index, indexStat } = inspectIndex(repoRoot);
+  if (indexStat === null) return "";
   const text = readFileSync(index, "utf8");
   if (unicodeCodePointCount(text) > INDEX_MAX_CHARS) {
-    throw new Error(`qq-wiki: wiki/index.md exceeds ${INDEX_MAX_CHARS} Unicode code points`);
+    throw new Error(`qq-index: README.md exceeds ${INDEX_MAX_CHARS} Unicode code points`);
   }
   return text;
 }
 
 function markdownDestinations(markdown) {
   const destinations = [];
-  const inline = /(?<!!)\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+["'][^\n)]*["'])?\s*\)/g;
+  const inline = /!?\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+["'][^\n)]*["'])?\s*\)/g;
   for (const match of markdown.matchAll(inline)) {
     destinations.push(match[1] ?? match[2]);
   }
@@ -75,7 +64,7 @@ function localPathFromDestination(destination) {
   try {
     decoded = decodeURIComponent(pathPart);
   } catch {
-    throw new Error(`qq-wiki: invalid link destination ${JSON.stringify(raw)}`);
+    throw new Error(`qq-index: invalid link destination ${JSON.stringify(raw)}`);
   }
   if (
     !decoded ||
@@ -84,7 +73,7 @@ function localPathFromDestination(destination) {
     isAbsolute(decoded) ||
     /^[A-Za-z][A-Za-z\d+.-]*:/.test(decoded)
   ) {
-    throw new Error(`qq-wiki: link must stay under wiki/: ${JSON.stringify(raw)}`);
+    throw new Error(`qq-index: link must be repository-relative: ${JSON.stringify(raw)}`);
   }
   return { raw, decoded };
 }
@@ -94,32 +83,31 @@ function isContained(root, candidate) {
   return rel === "" || (!isAbsolute(rel) && !rel.split(sep).includes(".."));
 }
 
-/** Validate index limits and every local page link. Returns true when valid. */
-export function validateWiki(repoRoot) {
-  const inspected = inspectWiki(repoRoot);
-  if (inspected.wikiStat === null) return true;
-  if (inspected.indexStat === null) {
-    throw new Error("qq-wiki: wiki/index.md is required when wiki/ exists");
-  }
+/** Validate the README bound and every local link. Returns true when valid. */
+export function validateIndex(repoRoot) {
+  const inspected = inspectIndex(repoRoot);
+  if (inspected.indexStat === null) return true;
 
   const index = loadIndex(repoRoot);
-  const canonicalWiki = realpathSync(inspected.wiki);
+  const canonicalRoot = realpathSync(inspected.root);
   for (const destination of markdownDestinations(index)) {
     const local = localPathFromDestination(destination);
     if (local === null) continue;
 
-    const target = resolve(inspected.wiki, local.decoded);
-    if (!isContained(inspected.wiki, target)) {
-      throw new Error(`qq-wiki: link escapes wiki/: ${JSON.stringify(local.raw)}`);
+    const target = resolve(inspected.root, local.decoded);
+    if (!isContained(inspected.root, target)) {
+      throw new Error(`qq-index: link escapes repository: ${JSON.stringify(local.raw)}`);
     }
     const targetStat = lstatIfPresent(target);
     if (targetStat === null || !targetStat.isFile()) {
-      throw new Error(`qq-wiki: linked page is not a regular file: ${JSON.stringify(local.raw)}`);
+      throw new Error(`qq-index: linked path is not a regular file: ${JSON.stringify(local.raw)}`);
     }
     const canonicalTarget = realpathSync(target);
-    if (!isContained(canonicalWiki, canonicalTarget)) {
-      throw new Error(`qq-wiki: linked page escapes wiki/: ${JSON.stringify(local.raw)}`);
+    if (!isContained(canonicalRoot, canonicalTarget)) {
+      throw new Error(`qq-index: linked path escapes repository: ${JSON.stringify(local.raw)}`);
     }
   }
   return true;
 }
+
+export const internals = Object.freeze({ markdownDestinations });

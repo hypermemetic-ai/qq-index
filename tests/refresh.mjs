@@ -6,14 +6,14 @@ import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
+import { parseCliArgs, parseRepositoryRegistry, repositoriesForCli, runCli } from "../src/cli.mjs";
 import { INDEX_MAX_CHARS } from "../src/index.mjs";
-import { parseRepositoryRegistry, repositoriesForCli, runCli } from "../src/cli.mjs";
 import { modelPassPlan } from "../src/model-pass.mjs";
 import { refreshRepository } from "../src/refresh.mjs";
 
 const execFile = promisify(execFileCallback);
 const roots = [];
-const FIXED_TIME = "2026-08-14T12:34:56.789Z";
+const EVIDENCE = "# qq-index evidence packet\n\n## Tracked files (`git ls-files`)\n\n```text\n\"README.md\"\n\"src/app.mjs\"\n```\n";
 
 async function command(commandName, args, options = {}) {
   const result = await execFile(commandName, args, { encoding: "utf8", ...options });
@@ -30,8 +30,8 @@ async function put(root, path, content) {
   await writeFile(absolute, content);
 }
 
-async function createRepository({ wiki = true } = {}) {
-  const root = await mkdtemp(resolve(tmpdir(), "qq-wiki-refresh-test-"));
+async function createRepository({ readme = true } = {}) {
+  const root = await mkdtemp(resolve(tmpdir(), "qq-index-refresh-test-"));
   roots.push(root);
   const origin = resolve(root, "origin.git");
   const source = resolve(root, "source");
@@ -39,12 +39,8 @@ async function createRepository({ wiki = true } = {}) {
   await command("git", ["init", "--initial-branch=main", source]);
   await git(source, "config", "user.name", "Live Checkout User");
   await git(source, "config", "user.email", "live@example.test");
-  await put(source, "README.md", "# Target\n");
-  if (wiki) await put(
-    source,
-    "wiki/index.md",
-    "# Target orientation\nRefreshed: 2025-01-01T00:00:00.000Z\n\n- Source wins.\n",
-  );
+  await put(source, "src/app.mjs", "export const value = 1;\n");
+  if (readme) await put(source, "README.md", "# Existing README\n\n[App](src/app.mjs)\n");
   await git(source, "add", "-A");
   await git(source, "commit", "-m", "Initial source");
   await git(source, "remote", "add", "origin", origin);
@@ -68,111 +64,148 @@ function quietLogger() {
   };
 }
 
-async function rejectsMessage(operation, pattern) {
-  await assert.rejects(operation, pattern);
+function refreshOptions(overrides = {}) {
+  return {
+    logger: quietLogger(),
+    harvestRepository: async () => EVIDENCE,
+    ...overrides,
+  };
 }
 
 try {
   {
     const { source, origin } = await createRepository();
     let modelCalls = 0;
-    const result = await refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async () => { modelCalls += 1; },
-    });
-    assert.equal(result.mode, "stamp-only");
-    assert.equal(modelCalls, 0);
-    const index = await readFile(resolve(source, "wiki/index.md"), "utf8");
-    assert.deepEqual(index.split("\n").slice(0, 3), [
-      "# Target orientation",
-      `Refreshed: ${FIXED_TIME}`,
-      "",
-    ]);
-    assert.equal(index.match(/^Refreshed:/gm)?.length, 1);
+    let receivedEvidence;
+    const result = await refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot, options) => {
+        modelCalls += 1;
+        receivedEvidence = options.evidencePacket;
+        await put(cloneRoot, "README.md", "# Generated index\n\n[App](src/app.mjs)\n");
+      },
+    }));
+    assert.equal(result.status, "published");
+    assert.equal(result.mode, "model");
+    assert.equal(modelCalls, 1);
+    assert.equal(receivedEvidence, EVIDENCE);
+    assert.match(await readFile(resolve(source, "README.md"), "utf8"), /Generated index/);
     assert.equal(await git(source, "status", "--porcelain"), "");
     assert.equal(await git(source, "show", "-s", "--format=%an <%ae>", "HEAD"),
       "qqp-bot <qqp-bot@users.noreply.github.com>");
-    assert.equal(await git(source, "show", "-s", "--format=%s", "HEAD"), "Refresh architect wiki");
+    assert.equal(await git(source, "show", "-s", "--format=%s", "HEAD"), "Refresh repository index");
     assert.equal(await git(source, "rev-parse", "HEAD"), await git(origin, "rev-parse", "main"));
+    assert.equal(await git(source, "show", "--format=", "--name-only", "HEAD"), "README.md");
 
-    // A subsequent run after a wiki-only writer commit remains stamp-only.
-    const second = await refreshRepository(source, {
-      now: "2026-08-14T20:00:00.000Z",
-      logger: quietLogger(),
+    const second = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => assert.fail("an unchanged source must not run the model"),
+    }));
+    assert.equal(second.status, "up-to-date");
+    assert.equal(await git(source, "rev-parse", "HEAD"), result.commit);
+
+    await commitAndPush(source, "src/app.mjs", "export const value = 2;\n", "Change source");
+    const third = await refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        modelCalls += 1;
+        await put(cloneRoot, "README.md", "# Updated index\n\n[App](src/app.mjs)\n");
+      },
+    }));
+    assert.equal(third.status, "published");
+    assert.equal(modelCalls, 2);
+    assert.match(await readFile(resolve(source, "README.md"), "utf8"), /Updated index/);
+
+    await commitAndPush(source, "src/app.mjs", "export const value = 3;\n", "Change source again");
+    const changedSource = await git(source, "rev-parse", "HEAD");
+    const fourth = await refreshRepository(source, refreshOptions({
       runModelPass: async () => { modelCalls += 1; },
-    });
-    assert.equal(second.mode, "stamp-only");
-    assert.equal(modelCalls, 0);
+    }));
+    assert.equal(fourth.status, "published");
+    assert.equal(fourth.mode, "model-noop");
+    assert.equal(fourth.parent, changedSource);
+    assert.equal(modelCalls, 3);
+    assert.notEqual(fourth.commit, changedSource);
+
+    const fifth = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => assert.fail("a post-source model noop must not be repeated"),
+    }));
+    assert.equal(fifth.status, "up-to-date");
+    assert.equal(await git(source, "rev-parse", "HEAD"), fourth.commit);
   }
 
   {
-    const { source } = await createRepository();
-    await put(source, "wiki/index.md", "# CRLF orientation\r\nRefreshed: 2025-01-01T00:00:00.000Z\r\n\r\nBody\r\n");
-    await git(source, "add", "wiki/index.md");
-    await git(source, "commit", "-m", "Use CRLF wiki");
-    await git(source, "push", "origin", "main");
-    await refreshRepository(source, { now: FIXED_TIME, logger: quietLogger() });
-    const index = await readFile(resolve(source, "wiki/index.md"), "utf8");
-    assert.equal(index, `# CRLF orientation\r\nRefreshed: ${FIXED_TIME}\r\n\r\nBody\r\n`);
+    const { source } = await createRepository({ readme: false });
+    const result = await refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await put(cloneRoot, "README.md", "# First index\n\n[App](src/app.mjs)\n");
+      },
+    }));
+    assert.equal(result.status, "published");
+    assert.match(await readFile(resolve(source, "README.md"), "utf8"), /^# First index/);
   }
 
   {
-    const { source } = await createRepository();
-    await commitAndPush(source, "src/app.mjs", "export const changed = true;\n", "Change source");
+    const { source, origin } = await createRepository();
+    const parent = await git(source, "rev-parse", "HEAD");
     let modelCalls = 0;
-    const result = await refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
+    const result = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => { modelCalls += 1; },
+    }));
+    assert.deepEqual(
+      { status: result.status, mode: result.mode, parent: result.parent },
+      { status: "published", mode: "model-noop", parent },
+    );
+    assert.equal(modelCalls, 1);
+    assert.notEqual(result.commit, parent);
+    assert.equal(await git(source, "rev-parse", "HEAD"), result.commit);
+    assert.equal(await git(origin, "rev-parse", "main"), result.commit);
+    assert.equal(await git(source, "show", "--format=", "--name-only", "HEAD"), "");
+    assert.equal(await git(source, "show", "-s", "--format=%T", "HEAD"),
+      await git(source, "show", "-s", "--format=%T", parent));
+
+    const second = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => assert.fail("a model-noop marker must advance the refresh cursor"),
+    }));
+    assert.equal(second.status, "up-to-date");
+    assert.equal(await git(source, "rev-parse", "HEAD"), result.commit);
+
+    await commitAndPush(source, "src/app.mjs", "export const value = 2;\n", "Source after noop marker");
+    const third = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => { modelCalls += 1; },
+    }));
+    assert.equal(third.status, "published");
+    assert.equal(third.mode, "model-noop");
+    assert.equal(modelCalls, 2);
+
+    await commitAndPush(source, "README.md", "# Human rewrite\n\n[App](src/app.mjs)\n", "Rewrite README manually");
+    const fourth = await refreshRepository(source, refreshOptions({
       runModelPass: async (cloneRoot) => {
         modelCalls += 1;
-        await put(cloneRoot, "wiki/ownership.md", "# Ownership\n");
-        await put(cloneRoot, "wiki/index.md", "# Target orientation\n\n- [Ownership](ownership.md)\n");
+        await put(cloneRoot, "README.md", "# Regenerated index\n\n[App](src/app.mjs)\n");
       },
-    });
-    assert.equal(result.mode, "model");
-    assert.equal(modelCalls, 1);
-    assert.match(await readFile(resolve(source, "wiki/index.md"), "utf8"), /ownership\.md/);
-  }
-
-  {
-    const { source } = await createRepository({ wiki: false });
-    let modelCalls = 0;
-    const result = await refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async (cloneRoot) => {
-        modelCalls += 1;
-        await put(cloneRoot, "wiki/index.md", "# First orientation\n\n- Source wins.\n");
-      },
-    });
-    assert.equal(result.mode, "model");
-    assert.equal(modelCalls, 1);
-    assert.match(await readFile(resolve(source, "wiki/index.md"), "utf8"), /^# First orientation\nRefreshed:/);
+    }));
+    assert.equal(fourth.status, "published");
+    assert.equal(fourth.mode, "model");
+    assert.equal(modelCalls, 3);
   }
 
   {
     const { source } = await createRepository();
-    await commitAndPush(source, "source.txt", "changed\n", "Source needs model");
     let releaseModel;
     let modelStarted;
     const started = new Promise((resolveStarted) => { modelStarted = resolveStarted; });
     const hold = new Promise((resolveHold) => { releaseModel = resolveHold; });
-    const first = refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async () => {
+    const first = refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
         modelStarted();
         await hold;
+        await put(cloneRoot, "README.md", "# Locked index\n\n[App](src/app.mjs)\n");
       },
-    });
+    }));
     await started;
     const logger = quietLogger();
-    const second = await refreshRepository(source, {
-      now: FIXED_TIME,
+    const second = await refreshRepository(source, refreshOptions({
       logger,
       runModelPass: async () => assert.fail("busy refresh must not spawn a model"),
-    });
+    }));
     assert.equal(second.status, "busy");
     assert.ok(logger.lines.some((line) => line.includes("already running")));
     releaseModel();
@@ -182,106 +215,124 @@ try {
   {
     const { source } = await createRepository();
     await put(source, "dirty.txt", "dirty\n");
-    await rejectsMessage(() => refreshRepository(source, { logger: quietLogger() }), /must be clean/);
+    await assert.rejects(() => refreshRepository(source, refreshOptions()), /must be clean/);
     await rm(resolve(source, "dirty.txt"));
     await git(source, "checkout", "-b", "not-main");
-    await rejectsMessage(() => refreshRepository(source, { logger: quietLogger() }), /must be on main/);
+    await assert.rejects(() => refreshRepository(source, refreshOptions()), /must be on main/);
   }
 
   {
     const { source } = await createRepository();
-    await commitAndPush(source, "source.txt", "first\n", "Source needs model");
-    await rejectsMessage(() => refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async () => {
-        await commitAndPush(source, "source.txt", "moved\n", "Move live main");
-      },
-    }), /live main moved/);
-    assert.equal(await readFile(resolve(source, "source.txt"), "utf8"), "moved\n");
-    assert.notEqual(await git(source, "show", "-s", "--format=%s", "HEAD"), "Refresh architect wiki");
-  }
-
-  {
-    const { source } = await createRepository();
-    await commitAndPush(source, "source.txt", "changed\n", "Source needs model");
-    const parent = await git(source, "rev-parse", "HEAD");
-    await rejectsMessage(() => refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
+    const initial = await git(source, "rev-parse", "HEAD");
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
       runModelPass: async (cloneRoot) => {
-        await put(cloneRoot, "wiki/index.md", "# Target orientation\n");
-        await put(cloneRoot, "NOT-WIKI.txt", "escaped\n");
+        await put(cloneRoot, "README.md", "# Raced index\n\n[App](src/app.mjs)\n");
+        await commitAndPush(source, "src/app.mjs", "export const value = 3;\n", "Move live main");
       },
-    }), /outside wiki.*NOT-WIKI/);
+    })), /live main moved/);
+    assert.notEqual(await git(source, "rev-parse", "HEAD"), initial);
+    assert.equal(await git(source, "show", "-s", "--format=%s", "HEAD"), "Move live main");
+  }
+
+  {
+    const { source } = await createRepository();
+    const parent = await git(source, "rev-parse", "HEAD");
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await put(cloneRoot, "README.md", "# Index\n\n[App](src/app.mjs)\n");
+        await put(cloneRoot, "NOT-README.txt", "escaped\n");
+      },
+    })), /other than README\.md.*NOT-README/);
     assert.equal(await git(source, "rev-parse", "HEAD"), parent);
+  }
+
+  {
+    const { source } = await createRepository();
+    await commitAndPush(source, ".gitignore", "scratch.log\n", "Ignore scratch");
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await put(cloneRoot, "README.md", "# Index\n\n[App](src/app.mjs)\n");
+        await put(cloneRoot, "scratch.log", "ignored but forbidden\n");
+      },
+    })), /other than README\.md.*scratch\.log/);
+  }
+
+  {
+    const { source } = await createRepository();
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await put(cloneRoot, "README.md", "# Broken\n\n[Missing](missing.mjs)\n");
+      },
+    })), /linked path is not a regular file/);
+  }
+
+  {
+    const { source } = await createRepository();
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await rm(resolve(cloneRoot, "README.md"));
+        await symlink("src/app.mjs", resolve(cloneRoot, "README.md"));
+      },
+    })), /README\.md must be a regular file/);
+  }
+
+  {
+    const { source } = await createRepository();
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        await put(cloneRoot, "README.md", "x".repeat(INDEX_MAX_CHARS + 1));
+      },
+    })), /exceeds 10000 Unicode code points/);
+  }
+
+  {
+    const { source } = await createRepository();
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => rm(resolve(cloneRoot, "README.md")),
+    })), /did not produce README\.md/);
+  }
+
+  {
+    const { source } = await createRepository();
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      validateIndex: async (cloneRoot) => put(cloneRoot, "validation-leak.txt", "leak\n"),
+      runModelPass: async (cloneRoot) => put(cloneRoot, "README.md", "# Index\n\n[App](src/app.mjs)\n"),
+    })), /other than README\.md.*validation-leak/);
+  }
+
+  {
+    const { source } = await createRepository();
+    const parent = await git(source, "rev-parse", "HEAD");
+    await git(source, "remote", "set-url", "origin", resolve(source, "missing-origin.git"));
+    await assert.rejects(() => refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => put(cloneRoot, "README.md", "# Index\n\n[App](src/app.mjs)\n"),
+    })), /git .*push origin main failed/);
+    assert.equal(await git(source, "rev-parse", "HEAD"), parent, "failed push rolls live main back");
     assert.equal(await git(source, "status", "--porcelain"), "");
   }
 
   {
-    const { source } = await createRepository();
-    await commitAndPush(source, "source.txt", "changed\n", "Source needs model");
-    const parent = await git(source, "rev-parse", "HEAD");
-    await rejectsMessage(() => refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async (cloneRoot) => {
-        await put(cloneRoot, "wiki/index.md", "# Target orientation\n\n- [Missing](missing.md)\n");
-      },
-    }), /linked page is not a regular file/);
-    assert.equal(await git(source, "rev-parse", "HEAD"), parent);
-  }
+    const base = resolve("/tmp/projects");
+    assert.deepEqual(parseRepositoryRegistry("a\n# c\n\na\n/path/b\n", { projectsRoot: base }), [
+      resolve(base, "a"),
+      "/path/b",
+    ]);
+    assert.deepEqual(parseCliArgs([]), { repo: undefined });
+    assert.deepEqual(parseCliArgs(["--repo", "a"]), { repo: "a" });
+    assert.deepEqual(parseCliArgs(["--help"]), { help: true });
+    assert.throws(() => parseCliArgs(["--bad"]), /qq-index: invalid arguments/);
 
-  {
-    const { source } = await createRepository();
-    await commitAndPush(source, "source.txt", "changed\n", "Source needs model");
-    const parent = await git(source, "rev-parse", "HEAD");
-    await rejectsMessage(() => refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async (cloneRoot) => {
-        await symlink("../README.md", resolve(cloneRoot, "wiki/unlinked.md"));
-      },
-    }), /not a regular file.*unlinked\.md/);
-    assert.equal(await git(source, "rev-parse", "HEAD"), parent);
-  }
-
-  {
-    const { source } = await createRepository();
-    const title = "# Target orientation\n";
-    const exactCap = title + "x".repeat(INDEX_MAX_CHARS - [...title].length);
-    await put(source, "wiki/index.md", exactCap);
-    await git(source, "add", "wiki/index.md");
-    await git(source, "commit", "-m", "Fill index cap");
-    await git(source, "push", "origin", "main");
-    const parent = await git(source, "rev-parse", "HEAD");
-    await rejectsMessage(() => refreshRepository(source, {
-      now: FIXED_TIME,
-      logger: quietLogger(),
-      runModelPass: async () => assert.fail("wiki-only history is stamp-only"),
-    }), /exceeds 10000 Unicode code points/);
-    assert.equal(await git(source, "rev-parse", "HEAD"), parent);
-  }
-
-  {
-    const parsed = parseRepositoryRegistry("\n# first wave\nqq-core\n/opt/qq-ui\nqq-core\n", {
-      home: "/home/tester",
-    });
-    assert.deepEqual(parsed, ["/home/tester/projects/qq-core", "/opt/qq-ui"]);
-    const one = await repositoriesForCli(["--repo", "qq-relay"], { home: "/home/tester" });
-    assert.deepEqual(one.repositories, ["/home/tester/projects/qq-relay"]);
-    const absolute = await repositoriesForCli(["--repo", "/srv/repo"], { home: "/home/tester" });
-    assert.deepEqual(absolute.repositories, ["/srv/repo"]);
-
-    const registryRoot = await mkdtemp(resolve(tmpdir(), "qq-wiki-registry-test-"));
+    const registryRoot = await mkdtemp(resolve(tmpdir(), "qq-index-registry-test-"));
     roots.push(registryRoot);
     const registry = resolve(registryRoot, "repositories");
     await writeFile(registry, "a\nb\nc\nd\ne\n");
+    const selection = await repositoriesForCli([], { projectsRoot: base, registryPath: registry });
+    assert.equal(selection.repositories.length, 5);
     let active = 0;
     let maximum = 0;
     const seen = [];
     await runCli([], {
-      home: registryRoot,
+      projectsRoot: base,
       registryPath: registry,
       logger: quietLogger(),
       refreshRepository: async (repository) => {
@@ -295,67 +346,89 @@ try {
     });
     assert.equal(maximum, 3);
     assert.equal(seen.length, 5);
+
+    const logger = quietLogger();
+    await assert.rejects(() => runCli(["--repo", "bad"], {
+      projectsRoot: base,
+      logger,
+      refreshRepository: async () => { throw new Error("boom"); },
+    }), /1 refresh failed/);
+    assert.ok(logger.lines.some((line) => line.includes("qq-index:") && line.includes("boom")));
   }
 
   {
     const repositoryRoot = resolve(new URL("..", import.meta.url).pathname);
-    const plan = modelPassPlan("/tmp/qq-wiki-clone", { packageRoot: repositoryRoot });
+    assert.throws(
+      () => modelPassPlan("/tmp/qq-index-clone", { packageRoot: repositoryRoot }),
+      /requires a non-empty evidence packet/,
+    );
+    const plan = modelPassPlan("/tmp/qq-index-clone", {
+      packageRoot: repositoryRoot,
+      evidencePacket: EVIDENCE,
+      env: {
+        QQ_INDEX_WRITER_PROMPT: "stale index prompt",
+        QQ_WIKI_WRITER_PROMPT: "stale wiki prompt",
+      },
+    });
     assert.equal(typeof plan.then, "undefined");
-    assert.equal(plan.cwd, "/tmp/qq-wiki-clone");
-    assert.deepEqual(plan.args.slice(0, 4), ["--profile", "headless", "--patch", resolve(repositoryRoot, "config/writer.patch.yml")]);
-    assert.equal(plan.args.at(-1), "Refresh this repository's architect orientation wiki.");
+    assert.equal(plan.cwd, "/tmp/qq-index-clone");
+    assert.deepEqual(plan.args.slice(0, 4), [
+      "--profile", "headless", "--patch", resolve(repositoryRoot, "config/writer.patch.yml"),
+    ]);
+    assert.equal(plan.args.at(-1), "Write this repository's README index from the supplied evidence packet.");
     assert.equal(plan.env.QQ_DSH_PROVIDER, "openai-codex");
     assert.equal(plan.env.QQ_DSH_MODEL, "gpt-5.6-sol");
     assert.equal(plan.env.QQ_DSH_REASONING_EFFORT, "xhigh");
-    assert.equal(Object.hasOwn(plan.env, "DSH_PERMISSION_MODE"), false);
-    assert.equal(plan.env.DSH_HOME, process.env.DSH_HOME);
-    assert.match(plan.env.QQ_WIKI_MODELS_ROOT, /qq-models$/);
-    assert.match(plan.env.QQ_WIKI_WORKFLOWS_ROOT, /qq-workflows$/);
+    assert.match(plan.env.QQ_INDEX_MODELS_ROOT, /qq-models$/);
+    assert.match(plan.env.QQ_INDEX_WORKFLOWS_ROOT, /qq-workflows$/);
 
-    const packet = plan.env.QQ_WIKI_WRITER_PROMPT;
-    assert.match(packet, /Forced phases/);
-    assert.match(packet, /only model-facing tool is `bash`/);
-    assert.match(packet, /Every response must call `bash`/);
-    assert.match(packet, /Mini's bounded observation window/);
-    assert.match(packet, /gpt-5\.6-sol/);
-    assert.match(packet, /`xhigh`/);
-    assert.match(packet, /finish by calling bash with exactly\n   `echo COMPLETE_DOCS_AND_EXIT`/);
-    assert.equal((packet.match(/echo COMPLETE_DOCS_AND_EXIT/g) ?? []).length, 1);
-    assert.doesNotMatch(packet, /Its tools are `read`|primary discovery interface/);
+    const prompt = plan.env.QQ_INDEX_WRITER_PROMPT;
+    assert.equal(plan.env.QQ_WIKI_WRITER_PROMPT, prompt);
+    assert.match(prompt, /complete and only evidence/);
+    assert.match(prompt, /Do not inspect the checkout/);
+    assert.match(prompt, /only\s+model-facing tool is Mini Docs/);
+    assert.match(prompt, /Replace only `README\.md`/);
+    assert.match(prompt, /# qq-index evidence packet/);
+    assert.equal(prompt.endsWith(`${EVIDENCE.trimEnd()}\n`), true);
+    assert.equal((prompt.match(/echo COMPLETE_DOCS_AND_EXIT/g) ?? []).length, 1);
+    assert.doesNotMatch(prompt, /^## Traps$/m);
 
     assert.match(plan.modelsPluginHref, /^file:\/\/.*\/qq-models\/src\/plugin\.mjs$/);
     assert.match(plan.miniDocsPluginHref, /^file:\/\/.*\/qq-workflows\/src\/mini-docs\.mjs$/);
     assert.match(plan.writerBootPluginHref, /^file:\/\/.*\/src\/writer-boot\.mjs$/);
-    assert.match(plan.overlaySource, /id: qq-wiki-models\n      name: "file:\/\/.*\/src\/plugin\.mjs"/);
+    assert.match(plan.overlaySource, /id: qq-index-models\n      name: "file:\/\/.*\/src\/plugin\.mjs"/);
     assert.match(plan.overlaySource, /id: qq-mini-docs\n      name: "file:\/\/.*\/src\/mini-docs\.mjs"/);
-    assert.match(plan.overlaySource, /id: qq-wiki-writer-boot\n      name: "file:\/\/.*\/src\/writer-boot\.mjs"/);
-    assert.equal(plan.overlaySource.includes("__QQ_WIKI_"), false);
+    assert.match(plan.overlaySource, /id: qq-index-writer-boot\n      name: "file:\/\/.*\/src\/writer-boot\.mjs"/);
+    assert.equal(plan.overlaySource.includes("__QQ_INDEX_"), false);
 
     const overlay = await readFile(resolve(repositoryRoot, "config/writer.patch.yml"), "utf8");
     assert.match(overlay, /id: approval\n  config:\n    policy: never/);
     assert.match(overlay, /id: tool-fs\n  disabled: true/);
     assert.match(overlay, /id: tool-fs-search\n  disabled: true/);
     assert.doesNotMatch(overlay, /id: tool-bash\n  disabled: true/);
-    assert.match(overlay, /id: qq-mini-docs\n      name: __QQ_WIKI_MINI_DOCS_PLUGIN__/);
-    assert.match(overlay, /id: qq-wiki-writer-boot\n      name: __QQ_WIKI_WRITER_BOOT_PLUGIN__/);
-    assert.equal(overlay.includes("!!js process.env.QQ_WIKI_WORKFLOWS_ROOT"), false);
+    assert.match(overlay, /id: qq-mini-docs\n      name: __QQ_INDEX_MINI_DOCS_PLUGIN__/);
+    assert.match(overlay, /id: qq-index-writer-boot\n      name: __QQ_INDEX_WRITER_BOOT_PLUGIN__/);
   }
 
   {
     const repositoryRoot = resolve(new URL("..", import.meta.url).pathname);
-    const workflowsOverride = await mkdtemp(resolve(tmpdir(), "qq-wiki-workflows-override-"));
+    const workflowsOverride = await mkdtemp(resolve(tmpdir(), "qq-index-workflows-override-"));
     roots.push(workflowsOverride);
     await put(workflowsOverride, "package.json", JSON.stringify({
       name: "@hypermemetic-ai/qq-workflows",
       type: "module",
     }));
     await put(workflowsOverride, "src/mini-docs.mjs", "export function miniDocsSetup() {}\n");
-    const plan = modelPassPlan("/tmp/qq-wiki-clone", {
+    const plan = modelPassPlan("/tmp/qq-index-clone", {
       packageRoot: repositoryRoot,
-      env: { QQ_WIKI_WORKFLOWS_ROOT: workflowsOverride },
+      evidencePacket: EVIDENCE,
+      env: { QQ_INDEX_WORKFLOWS_ROOT: workflowsOverride },
     });
-    assert.equal(plan.env.QQ_WIKI_WORKFLOWS_ROOT, workflowsOverride);
-    assert.equal(plan.miniDocsPluginHref, new URL("src/mini-docs.mjs", `${pathToFileURL(workflowsOverride).href}/`).href);
+    assert.equal(plan.env.QQ_INDEX_WORKFLOWS_ROOT, workflowsOverride);
+    assert.equal(
+      plan.miniDocsPluginHref,
+      new URL("src/mini-docs.mjs", `${pathToFileURL(workflowsOverride).href}/`).href,
+    );
   }
 
   console.log("refresh program: ok");
