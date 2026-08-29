@@ -112,6 +112,23 @@ try {
     assert.equal(third.status, "published");
     assert.equal(modelCalls, 2);
     assert.match(await readFile(resolve(source, "README.md"), "utf8"), /Updated index/);
+
+    await commitAndPush(source, "src/app.mjs", "export const value = 3;\n", "Change source again");
+    const changedSource = await git(source, "rev-parse", "HEAD");
+    const fourth = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => { modelCalls += 1; },
+    }));
+    assert.equal(fourth.status, "published");
+    assert.equal(fourth.mode, "model-noop");
+    assert.equal(fourth.parent, changedSource);
+    assert.equal(modelCalls, 3);
+    assert.notEqual(fourth.commit, changedSource);
+
+    const fifth = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => assert.fail("a post-source model noop must not be repeated"),
+    }));
+    assert.equal(fifth.status, "up-to-date");
+    assert.equal(await git(source, "rev-parse", "HEAD"), fourth.commit);
   }
 
   {
@@ -126,16 +143,48 @@ try {
   }
 
   {
-    const { source } = await createRepository();
+    const { source, origin } = await createRepository();
     const parent = await git(source, "rev-parse", "HEAD");
+    let modelCalls = 0;
     const result = await refreshRepository(source, refreshOptions({
-      runModelPass: async () => {},
+      runModelPass: async () => { modelCalls += 1; },
     }));
     assert.deepEqual(
       { status: result.status, mode: result.mode, parent: result.parent },
-      { status: "up-to-date", mode: "model-noop", parent },
+      { status: "published", mode: "model-noop", parent },
     );
-    assert.equal(await git(source, "rev-parse", "HEAD"), parent);
+    assert.equal(modelCalls, 1);
+    assert.notEqual(result.commit, parent);
+    assert.equal(await git(source, "rev-parse", "HEAD"), result.commit);
+    assert.equal(await git(origin, "rev-parse", "main"), result.commit);
+    assert.equal(await git(source, "show", "--format=", "--name-only", "HEAD"), "");
+    assert.equal(await git(source, "show", "-s", "--format=%T", "HEAD"),
+      await git(source, "show", "-s", "--format=%T", parent));
+
+    const second = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => assert.fail("a model-noop marker must advance the refresh cursor"),
+    }));
+    assert.equal(second.status, "up-to-date");
+    assert.equal(await git(source, "rev-parse", "HEAD"), result.commit);
+
+    await commitAndPush(source, "src/app.mjs", "export const value = 2;\n", "Source after noop marker");
+    const third = await refreshRepository(source, refreshOptions({
+      runModelPass: async () => { modelCalls += 1; },
+    }));
+    assert.equal(third.status, "published");
+    assert.equal(third.mode, "model-noop");
+    assert.equal(modelCalls, 2);
+
+    await commitAndPush(source, "README.md", "# Human rewrite\n\n[App](src/app.mjs)\n", "Rewrite README manually");
+    const fourth = await refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => {
+        modelCalls += 1;
+        await put(cloneRoot, "README.md", "# Regenerated index\n\n[App](src/app.mjs)\n");
+      },
+    }));
+    assert.equal(fourth.status, "published");
+    assert.equal(fourth.mode, "model");
+    assert.equal(modelCalls, 3);
   }
 
   {

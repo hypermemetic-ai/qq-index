@@ -121,13 +121,29 @@ async function commonGitDir(repoRoot) {
 }
 
 async function latestIndexCommit(cloneRoot) {
-  const record = await gitText(cloneRoot, [
-    "log", "-1", "--format=%H%x00%an%x00%ae%x00%s", "--", INDEX_PATH,
+  // A validated model no-op is an empty refresh commit, so its cursor cannot be
+  // found with a path-limited log. Still require it to follow the latest README
+  // commit so an older bot commit cannot bless a later human README rewrite.
+  const marker = await gitText(cloneRoot, [
+    "log", "-1", "--fixed-strings", `--grep=${COMMIT_MESSAGE}`, `--author=${BOT_EMAIL}`,
+    "--format=%H%x00%an%x00%ae%x00%s",
   ]);
-  if (!record) return null;
-  const [revision, author, email, subject] = record.split("\0");
+  if (!marker) return null;
+  const [revision, author, email, subject] = marker.split("\0");
   if (author !== BOT_NAME || email !== BOT_EMAIL || subject !== COMMIT_MESSAGE) return null;
-  return revision;
+
+  const latestReadmeRevision = await gitText(cloneRoot, [
+    "log", "-1", "--format=%H", "--", INDEX_PATH,
+  ]);
+  if (!latestReadmeRevision) return null;
+  if (latestReadmeRevision === revision) return revision;
+
+  const mergeBase = await gitText(cloneRoot, ["merge-base", latestReadmeRevision, revision]);
+  if (mergeBase !== latestReadmeRevision) return null;
+  const markerDiff = await git(cloneRoot, [
+    "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-m", "--root", "-z", revision,
+  ], { encoding: null });
+  return nulPaths(markerDiff.stdout).length === 0 ? revision : null;
 }
 
 async function hasSourceCommitsSinceIndex(cloneRoot) {
@@ -213,11 +229,14 @@ async function requireRegularStagedIndex(cloneRoot) {
   }
 }
 
-async function commitIndex(cloneRoot) {
+async function commitIndex(cloneRoot, { allowEmpty = false } = {}) {
+  const commitArgs = ["commit", "--no-gpg-sign"];
+  if (allowEmpty) commitArgs.push("--allow-empty");
+  commitArgs.push("-m", COMMIT_MESSAGE);
   await git(cloneRoot, [
     "-c", `user.name=${BOT_NAME}`,
     "-c", `user.email=${BOT_EMAIL}`,
-    "commit", "--no-gpg-sign", "-m", COMMIT_MESSAGE,
+    ...commitArgs,
   ]);
   return gitText(cloneRoot, ["rev-parse", "HEAD"]);
 }
@@ -278,8 +297,15 @@ export async function refreshRepository(repoRoot, options = {}) {
     const changedPaths = await requireIndexOnlyWorktree(cloneRoot);
 
     if (changedPaths.length === 0) {
-      logger.log(`qq-index: model produced no index change for ${root}`);
-      return { status: "up-to-date", mode: "model-noop", parent: sourceRevision };
+      const writerCommit = await commitIndex(cloneRoot, { allowEmpty: true });
+      await publish(root, cloneRoot, sourceRevision, writerCommit);
+      logger.log(`qq-index: refreshed ${root} (model produced no index change)`);
+      return {
+        status: "published",
+        mode: "model-noop",
+        parent: sourceRevision,
+        commit: writerCommit,
+      };
     }
 
     await git(cloneRoot, ["reset", "--mixed", sourceRevision]);
