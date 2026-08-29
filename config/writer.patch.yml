@@ -1,10 +1,10 @@
-# qq-wiki's headless writer overlay. The wrapper supplies the frozen packet in
-# the environment. DSH imports plugin `name` before evaluating !!js, so
-# model-pass replaces every token below with an absolute file: URL.
+# qq-index's headless writer overlay. Model-pass supplies the frozen contract
+# plus deterministic evidence packet. DSH imports plugin `name` before
+# evaluating !!js, so model-pass replaces every token with an absolute URL.
 
 - id: system-prompt
   config:
-    persona: !!js process.env.QQ_WIKI_WRITER_PROMPT
+    persona: !!js process.env.QQ_INDEX_WRITER_PROMPT
 
 - id: agent-default-model
   config:
@@ -27,15 +27,12 @@
   config:
     mode: native
 
-# Mini Docs wraps the inherited bash tool and restricts the runtime catalog to
-# that replacement. Do not register native filesystem discovery or edit tools.
+# Mini Docs wraps inherited bash and restricts the runtime catalog to it.
 - id: tool-fs
   disabled: true
 - id: tool-fs-search
   disabled: true
 
-# These prompt/presentation bundles are unused by the complete Mini Docs
-# persona. tool-bash deliberately remains enabled for Mini Docs to wrap.
 - id: attachment-local
   disabled: true
 - id: agent-instructions
@@ -46,9 +43,9 @@
   disabled: true
 
 - insert:
-    - id: qq-wiki-models
-      name: __QQ_WIKI_MODELS_ROOT__
+    - id: qq-index-models
+      name: __QQ_INDEX_MODELS_ROOT__
     - id: qq-mini-docs
-      name: __QQ_WIKI_MINI_DOCS_PLUGIN__
-    - id: qq-wiki-writer-boot
-      name: __QQ_WIKI_WRITER_BOOT_PLUGIN__
+      name: __QQ_INDEX_MINI_DOCS_PLUGIN__
+    - id: qq-index-writer-boot
+      name: __QQ_INDEX_WRITER_BOOT_PLUGIN__

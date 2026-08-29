@@ -1,58 +1,88 @@
-# qq-wiki
+# qq-index
 
-A repository may keep an architect orientation wiki in `wiki/`. Its
-`wiki/index.md` is a small routing table that tells an architect which page to
-read for a job. Source and tests remain authoritative; the wiki only shortens
-the route to them.
+`@hypermemetic-ai/qq-index` keeps a repository’s orientation at the place
+people and tools already look: root `README.md`. The same bounded document is
+visible on GitHub, included as npm package documentation, and returned by
+`loadIndex`. There is no separate wiki or page graph.
 
-A page describes one **ownership boundary whose invariants must be held
-together to plan**. It is not one page per feature, file, or directory.
+## Start here
 
-- Split topics that change independently and do not share invariants.
-- Merge topics when changing one usually requires the other's invariants, or
-  when a separate page would serve only one rare job.
-- Put the big picture in the index. Keep outbound sibling joints to one-line
-  routes there and a short “Sits with” pointer on the relevant page.
-- A typical job should need one page besides the index, or two for a real
-  ownership joint. Three needs explicit justification. Do not design routes
-  that normally require four or more pages.
-- Prefer deleting a wrong page to preserving or padding it.
+- [`src/index.mjs`](src/index.mjs) is the public synchronous boundary. It loads
+  a README up to 10,000 Unicode code points and validates relative Markdown
+  links without allowing links to escape the repository.
+- [`src/harvest.mjs`](src/harvest.mjs) creates the model’s deterministic evidence
+  packet from tracked paths, normalized package metadata, fixed-window change
+  heat, and relative-import fan-in.
+- [`prompts/writer.md`](prompts/writer.md) constrains the model to that packet and
+  to one output file. The model cannot browse source or create secondary docs.
+- [`src/refresh.mjs`](src/refresh.mjs) owns isolation, validation, commit, and
+  fast-forward publication. It rejects every model change except `README.md`.
 
-Every page uses these headings and stays scannable (aim for at most 150 lines):
+## Data flow
 
-1. What it is
-2. Sits with
-3. Invariants
-4. Look in
-5. Traps
+1. The outer program clones a clean `main` checkout under a per-repository lock.
+2. [`harvestRepository`](src/harvest.mjs) records `git ls-files`, `package.json`,
+   path heat over a fixed commit window, and module fan-in in stable order.
+3. [`src/model-pass.mjs`](src/model-pass.mjs) appends that packet to the frozen
+   writer contract and launches the headless model through
+   [`config/writer.patch.yml`](config/writer.patch.yml).
+4. [`src/writer-boot.mjs`](src/writer-boot.mjs) mounts qq-workflows’ Mini Docs
+   adapter on every headless agent and supplies the minimal `qq-core` surface it
+   requires. Mini Docs owns wrapped bash and completion interception.
+5. The outer program verifies the README-only diff, validates local links,
+   commits as `qqp-bot`, checks that live `main` has not moved, and publishes by
+   fast-forward.
 
-`wiki/index.md` is capped at 10,000 Unicode code points. Each index entry is a
-path plus when to read it. A writer refresh always puts
-`Refreshed: <ISO 8601 UTC>` immediately after the index title; that line counts
-toward the cap. A missing wiki contributes no context. When the wiki and the
-repository disagree, source wins.
+The packet is intentionally source-free. Package metadata supports package and
+command claims; paths, heat, and fan-in support routing and prioritization.
+Names alone are not treated as proof of runtime semantics.
 
-`prompts/writer.md` is the frozen bash-only writer packet. The inner headless
-pass loads qq-workflows' `qq-mini-docs` adapter, while a tiny qq-wiki boot plugin
-mounts that adapter on the headerless agent created by the headless runner. Mini
-Docs supplies the bounded observation window, bash wrapper, format retry, and
-exact completion sentinel. The inner pass never commits or invokes Land.
+## Public API
 
-That writer pass is not the Mini implementer or QA child in an operator
-workflow. qq-workflows also owns architect index attachment, but the attachment
-audience remains the architect: Mini implementer and QA children still do not
-receive the index.
+```js
+import {
+  INDEX_MAX_CHARS,
+  loadIndex,
+  validateIndex,
+} from "@hypermemetic-ai/qq-index";
 
-This package owns the loader, validation, convention, packet, writer boot, and
-outer refresh program. The outer program runs the model in an isolated
-worktree, validates the result, checks the wiki-only path boundary, and still
-commits and publishes mechanically. Each repository owns its own `wiki/`
-content.
+const orientation = loadIndex(repositoryRoot); // "" when README.md is absent
+validateIndex(repositoryRoot);                 // true or throws
+```
 
-The refresh program lives in `src/refresh.mjs` and `bin/qq-wiki-refresh`;
-`src/model-pass.mjs` resolves both qq-models and qq-workflows and spawns DSH with
-the package-owned `config/writer.patch.yml`. `config/repositories` is the
-bounded first-wave registry. The shipped user timer invokes the program
-directly: the timer is not an operator workflow and is not owned by
-qq-workflows. Tests use temporary repositories and stub the model pass in
-`tests/refresh.mjs`.
+`validateIndex` ignores external URLs and in-document fragments. Every relative
+link and image must resolve to a regular file under the repository root;
+encoded traversal, absolute paths, missing files, directories, and escaping
+symlinks fail validation.
+
+## Run and verify
+
+```bash
+npm test
+bin/qq-index-refresh --repo /path/to/repository
+```
+
+With no `--repo`, the CLI reads the bounded registry in
+[`config/repositories`](config/repositories) and refreshes at concurrency three.
+The packaged oneshot and schedule are
+[`systemd/user/qq-index.service`](systemd/user/qq-index.service) and
+[`systemd/user/qq-index.timer`](systemd/user/qq-index.timer). The checkout folder
+remains `qq-wiki`, so the service’s working directory deliberately retains that
+physical path even though the product and executable are `qq-index`.
+
+## Change map
+
+- Loader limits or link policy: start with
+  [`src/index.mjs`](src/index.mjs) and [`tests/index.mjs`](tests/index.mjs).
+- Packet shape, path ranking, or import resolution: start with
+  [`src/harvest.mjs`](src/harvest.mjs) and
+  [`tests/harvest.mjs`](tests/harvest.mjs).
+- Model, Mini Docs, or DSH overlay behavior: read
+  [`src/model-pass.mjs`](src/model-pass.mjs),
+  [`src/writer-boot.mjs`](src/writer-boot.mjs), and
+  [`tests/writer-boot.mjs`](tests/writer-boot.mjs) together.
+- Locking, source-change detection, Git boundaries, or publication: start with
+  [`src/refresh.mjs`](src/refresh.mjs) and
+  [`tests/refresh.mjs`](tests/refresh.mjs).
+- Registry selection and bounded parallelism live in
+  [`src/cli.mjs`](src/cli.mjs).

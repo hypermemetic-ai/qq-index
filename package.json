@@ -1,9 +1,9 @@
 {
-  "name": "@hypermemetic-ai/qq-wiki",
+  "name": "@hypermemetic-ai/qq-index",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Bounded architect orientation wikis for Git repositories.",
+  "description": "Bounded repository orientation in README.md.",
   "main": "src/index.mjs",
   "exports": {
     ".": "./src/index.mjs"
@@ -17,9 +17,9 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/corpus.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
+    "test": "node tests/index.mjs && node tests/harvest.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
   },
   "bin": {
-    "qq-wiki-refresh": "bin/qq-wiki-refresh"
+    "qq-index-refresh": "bin/qq-index-refresh"
   }
 }

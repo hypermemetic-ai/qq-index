@@ -2,15 +2,12 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
-import {
-  INDEX_MAX_CHARS,
-  loadIndex,
-  validateWiki,
-} from "../src/index.mjs";
+
+import { INDEX_MAX_CHARS, loadIndex, validateIndex } from "../src/index.mjs";
 
 const roots = [];
 async function temporaryRepo() {
-  const root = await mkdtemp(resolve(tmpdir(), "qq-wiki-test-"));
+  const root = await mkdtemp(resolve(tmpdir(), "qq-index-test-"));
   roots.push(root);
   return root;
 }
@@ -24,93 +21,95 @@ async function put(root, path, contents = "") {
 try {
   const missing = await temporaryRepo();
   assert.equal(loadIndex(missing), "");
-  assert.equal(validateWiki(missing), true);
-
+  assert.equal(validateIndex(missing), true);
   assert.equal(INDEX_MAX_CHARS, 10_000);
 
   const exactCap = await temporaryRepo();
-  await put(exactCap, "wiki/index.md", "x".repeat(INDEX_MAX_CHARS));
+  await put(exactCap, "README.md", "x".repeat(INDEX_MAX_CHARS));
   assert.equal([...loadIndex(exactCap)].length, INDEX_MAX_CHARS);
-  assert.equal(validateWiki(exactCap), true);
+  assert.equal(validateIndex(exactCap), true);
 
   const oversized = await temporaryRepo();
-  await put(oversized, "wiki/index.md", "x".repeat(INDEX_MAX_CHARS + 1));
-  assert.throws(() => loadIndex(oversized), /exceeds 10000 Unicode code points/);
-  assert.throws(() => validateWiki(oversized), /exceeds 10000 Unicode code points/);
+  await put(oversized, "README.md", "x".repeat(INDEX_MAX_CHARS + 1));
+  assert.throws(() => loadIndex(oversized), /README\.md exceeds 10000 Unicode code points/);
+  assert.throws(() => validateIndex(oversized), /README\.md exceeds 10000 Unicode code points/);
 
   const unicodeAtCap = await temporaryRepo();
   const unicodeIndex = `${"é".repeat(INDEX_MAX_CHARS - 1)}😀`;
   assert.equal([...unicodeIndex].length, INDEX_MAX_CHARS);
   assert.ok(Buffer.byteLength(unicodeIndex) > INDEX_MAX_CHARS);
-  await put(unicodeAtCap, "wiki/index.md", unicodeIndex);
+  await put(unicodeAtCap, "README.md", unicodeIndex);
   assert.equal(loadIndex(unicodeAtCap), unicodeIndex);
-  assert.equal(validateWiki(unicodeAtCap), true);
-  await put(unicodeAtCap, "wiki/index.md", `${unicodeIndex}x`);
-  assert.throws(() => loadIndex(unicodeAtCap), /exceeds 10000 Unicode code points/);
-
-  const manyLines = await temporaryRepo();
-  await put(manyLines, "wiki/index.md", "x\n".repeat(1_000));
-  assert.equal(validateWiki(manyLines), true);
-
-  const stamped = await temporaryRepo();
-  const stampedHeader = "# Orientation\nRefreshed: 2026-08-27T16:28:00Z\n\n";
-  const stampedAtCap = `${stampedHeader}${"x".repeat(
-    INDEX_MAX_CHARS - [...stampedHeader].length,
-  )}`;
-  await put(stamped, "wiki/index.md", stampedAtCap);
-  assert.equal([...loadIndex(stamped)].length, INDEX_MAX_CHARS);
-  assert.equal(validateWiki(stamped), true);
-  await put(stamped, "wiki/index.md", `${stampedAtCap}x`);
-  assert.throws(() => validateWiki(stamped), /exceeds 10000 Unicode code points/);
-
-  const broken = await temporaryRepo();
-  await put(broken, "wiki/index.md", "- [Missing](missing.md)\n");
-  assert.throws(() => validateWiki(broken), /not a regular file.*missing\.md/);
+  await put(unicodeAtCap, "README.md", `${unicodeIndex}x`);
+  assert.throws(() => validateIndex(unicodeAtCap), /exceeds 10000/);
 
   const valid = await temporaryRepo();
-  await put(valid, "wiki/index.md", "- [Page](pages/page.md#invariants)\n");
-  await put(valid, "wiki/pages/page.md", "# Page\n");
-  assert.equal(validateWiki(valid), true);
+  await put(valid, "README.md", [
+    "# Index",
+    "[Module](src/module.mjs#api)",
+    "![Diagram](assets/diagram.svg)",
+    "[Config][config]",
+    "[Section](#index)",
+    "[Web](https://example.test/path)",
+    "[Mail](mailto:test@example.test)",
+    "",
+    "[config]: <package.json> \"manifest\"",
+    "",
+  ].join("\n"));
+  await put(valid, "src/module.mjs", "export {};\n");
+  await put(valid, "assets/diagram.svg", "<svg/>\n");
+  await put(valid, "package.json", "{}\n");
+  assert.equal(validateIndex(valid), true);
 
-  const referenceLink = await temporaryRepo();
-  await put(referenceLink, "wiki/index.md", "- [Page][route]\n\n[route]: page.md\n");
-  await put(referenceLink, "wiki/page.md", "# Page\n");
-  assert.equal(validateWiki(referenceLink), true);
+  const broken = await temporaryRepo();
+  await put(broken, "README.md", "[Missing](missing.mjs)\n");
+  assert.throws(() => validateIndex(broken), /not a regular file.*missing\.mjs/);
+
+  const brokenImage = await temporaryRepo();
+  await put(brokenImage, "README.md", "![Missing](missing.svg)\n");
+  assert.throws(() => validateIndex(brokenImage), /not a regular file.*missing\.svg/);
 
   const directoryLink = await temporaryRepo();
-  await put(directoryLink, "wiki/index.md", "- [Not a page](pages)\n");
-  await mkdir(resolve(directoryLink, "wiki/pages"));
-  assert.throws(() => validateWiki(directoryLink), /not a regular file/);
+  await put(directoryLink, "README.md", "[Directory](src/)\n");
+  await mkdir(resolve(directoryLink, "src"));
+  assert.throws(() => validateIndex(directoryLink), /not a regular file/);
 
   const escaping = await temporaryRepo();
-  await put(escaping, "wiki/index.md", "- [Outside](../outside.md)\n");
-  await put(escaping, "outside.md", "outside\n");
-  assert.throws(() => validateWiki(escaping), /escapes wiki/);
+  await put(escaping, "README.md", "[Outside](../outside.md)\n");
+  assert.throws(() => validateIndex(escaping), /escapes repository/);
 
   const encodedEscape = await temporaryRepo();
-  await put(encodedEscape, "wiki/index.md", "- [Outside](%2e%2e/outside.md)\n");
-  await put(encodedEscape, "outside.md", "outside\n");
-  assert.throws(() => validateWiki(encodedEscape), /escapes wiki/);
+  await put(encodedEscape, "README.md", "[Outside](%2e%2e/outside.md)\n");
+  assert.throws(() => validateIndex(encodedEscape), /escapes repository/);
+
+  const absolute = await temporaryRepo();
+  await put(absolute, "README.md", "[Absolute](/etc/passwd)\n");
+  assert.throws(() => validateIndex(absolute), /repository-relative/);
+
+  const invalidEncoding = await temporaryRepo();
+  await put(invalidEncoding, "README.md", "[Bad](%ZZ)\n");
+  assert.throws(() => validateIndex(invalidEncoding), /invalid link destination/);
 
   const symlinked = await temporaryRepo();
-  await put(symlinked, "wiki/index.md", "- [Outside](outside.md)\n");
-  await put(symlinked, "outside.md", "outside\n");
-  await symlink(resolve(symlinked, "outside.md"), resolve(symlinked, "wiki/outside.md"));
-  assert.throws(() => validateWiki(symlinked), /not a regular file/);
+  await put(symlinked, "README.md", "[Link](link.mjs)\n");
+  await put(symlinked, "source.mjs", "export {};\n");
+  await symlink(resolve(symlinked, "source.mjs"), resolve(symlinked, "link.mjs"));
+  assert.throws(() => validateIndex(symlinked), /not a regular file/);
 
   const symlinkAncestor = await temporaryRepo();
-  await put(symlinkAncestor, "wiki/index.md", "- [Outside](pages/page.md)\n");
-  await put(symlinkAncestor, "outside/page.md", "outside\n");
-  await symlink(resolve(symlinkAncestor, "outside"), resolve(symlinkAncestor, "wiki/pages"));
-  assert.throws(() => validateWiki(symlinkAncestor), /linked page escapes wiki/);
+  const outside = await temporaryRepo();
+  await put(symlinkAncestor, "README.md", "[Outside](linked/file.mjs)\n");
+  await put(outside, "file.mjs", "export {};\n");
+  await symlink(outside, resolve(symlinkAncestor, "linked"));
+  assert.throws(() => validateIndex(symlinkAncestor), /linked path escapes repository/);
 
-  const wikiWithoutIndex = await temporaryRepo();
-  await mkdir(resolve(wikiWithoutIndex, "wiki"));
-  assert.equal(loadIndex(wikiWithoutIndex), "");
-  assert.throws(() => validateWiki(wikiWithoutIndex), /index\.md is required/);
+  const readmeSymlink = await temporaryRepo();
+  await put(readmeSymlink, "actual.md", "# Index\n");
+  await symlink(resolve(readmeSymlink, "actual.md"), resolve(readmeSymlink, "README.md"));
+  assert.throws(() => loadIndex(readmeSymlink), /README\.md must be a regular file/);
 
   const repositoryRoot = resolve(new URL("..", import.meta.url).pathname);
-  assert.equal(validateWiki(repositoryRoot), true);
+  assert.equal(validateIndex(repositoryRoot), true);
 
   console.log("index loader: ok");
 } finally {

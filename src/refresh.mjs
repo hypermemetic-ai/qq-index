@@ -1,18 +1,20 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { validateWiki } from "./index.mjs";
+import { harvestRepository as defaultHarvestRepository } from "./harvest.mjs";
+import { validateIndex } from "./index.mjs";
 import { runModelPass as defaultRunModelPass } from "./model-pass.mjs";
 
 const execFile = promisify(execFileCallback);
 const BOT_NAME = "qqp-bot";
 const BOT_EMAIL = "qqp-bot@users.noreply.github.com";
-const COMMIT_MESSAGE = "Refresh architect wiki";
-const LOCK_NAME = "qq-wiki-refresh.lock";
+const COMMIT_MESSAGE = "Refresh repository index";
+const LOCK_NAME = "qq-index-refresh.lock";
+const INDEX_PATH = "README.md";
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 
 function errorText(error) {
@@ -28,7 +30,7 @@ async function run(command, args, options = {}) {
     });
   } catch (error) {
     const detail = errorText(error);
-    throw new Error(`qq-wiki: ${command} ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`, {
+    throw new Error(`qq-index: ${command} ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`, {
       cause: error,
     });
   }
@@ -42,13 +44,13 @@ async function gitText(repoRoot, args) {
   return (await git(repoRoot, args)).stdout.trim();
 }
 
-function nulPaths(buffer) {
-  const text = Buffer.isBuffer(buffer) ? buffer.toString("utf8") : buffer;
+function nulPaths(value) {
+  const text = Buffer.isBuffer(value) ? value.toString("utf8") : value;
   return text.split("\0").filter(Boolean);
 }
 
-function isWikiPath(path) {
-  return path.startsWith("wiki/") && !path.split("/").includes("..");
+function isIndexPath(path) {
+  return path === INDEX_PATH;
 }
 
 async function requireMainAndClean(repoRoot, expectedRevision) {
@@ -56,15 +58,15 @@ async function requireMainAndClean(repoRoot, expectedRevision) {
   try {
     branch = await gitText(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
   } catch {
-    throw new Error("qq-wiki: source checkout must be on main (detached HEAD)");
+    throw new Error("qq-index: source checkout must be on main (detached HEAD)");
   }
-  if (branch !== "main") throw new Error(`qq-wiki: source checkout must be on main (found ${branch})`);
+  if (branch !== "main") throw new Error(`qq-index: source checkout must be on main (found ${branch})`);
   const revision = await gitText(repoRoot, ["rev-parse", "HEAD"]);
   if (expectedRevision !== undefined && revision !== expectedRevision) {
-    throw new Error("qq-wiki: live main moved during refresh; retry on the next tick");
+    throw new Error("qq-index: live main moved during refresh; retry on the next tick");
   }
   const status = (await git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).stdout;
-  if (status !== "") throw new Error("qq-wiki: source checkout must be clean");
+  if (status !== "") throw new Error("qq-index: source checkout must be clean");
   return revision;
 }
 
@@ -89,7 +91,7 @@ async function acquireLock(lockPath) {
       settled = true;
       reject(error);
     };
-    child.once("error", (error) => fail(new Error(`qq-wiki: cannot acquire refresh lock: ${error.message}`)));
+    child.once("error", (error) => fail(new Error(`qq-index: cannot acquire refresh lock: ${error.message}`)));
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
       if (!settled && stdout.includes("locked\n")) {
@@ -108,7 +110,7 @@ async function acquireLock(lockPath) {
       if (settled) return;
       settled = true;
       if (code === 1) resolvePromise({ busy: true, release: async () => {} });
-      else reject(new Error(`qq-wiki: refresh lock helper exited with code ${code}`));
+      else reject(new Error(`qq-index: refresh lock helper exited with code ${code}`));
     });
   });
 }
@@ -118,72 +120,69 @@ async function commonGitDir(repoRoot) {
   return resolve(repoRoot, raw);
 }
 
-async function hasSourceCommitsSinceWiki(cloneRoot) {
+async function latestIndexCommit(cloneRoot) {
+  const record = await gitText(cloneRoot, [
+    "log", "-1", "--format=%H%x00%an%x00%ae%x00%s", "--", INDEX_PATH,
+  ]);
+  if (!record) return null;
+  const [revision, author, email, subject] = record.split("\0");
+  if (author !== BOT_NAME || email !== BOT_EMAIL || subject !== COMMIT_MESSAGE) return null;
+  return revision;
+}
+
+async function hasSourceCommitsSinceIndex(cloneRoot) {
   try {
-    await lstat(resolve(cloneRoot, "wiki/index.md"));
+    const stat = await lstat(resolve(cloneRoot, INDEX_PATH));
+    if (!stat.isFile() || stat.isSymbolicLink()) return true;
   } catch (error) {
     if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return true;
     throw error;
   }
 
-  const lastWikiCommit = await gitText(cloneRoot, ["log", "-1", "--format=%H", "--", "wiki/"]);
-  if (!lastWikiCommit) return true;
-  const revisions = (await gitText(cloneRoot, ["rev-list", `${lastWikiCommit}..HEAD`]))
+  const lastIndexCommit = await latestIndexCommit(cloneRoot);
+  if (lastIndexCommit === null) return true;
+  const revisions = (await gitText(cloneRoot, ["rev-list", `${lastIndexCommit}..HEAD`]))
     .split("\n")
     .filter(Boolean);
   for (const revision of revisions) {
     const output = await git(cloneRoot, [
       "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-m", "--root", "-z", revision,
     ], { encoding: null });
-    if (nulPaths(output.stdout).some((path) => !isWikiPath(path))) return true;
+    if (nulPaths(output.stdout).some((path) => !isIndexPath(path))) return true;
   }
   return false;
-}
-
-function refreshedIso(now) {
-  const value = typeof now === "function" ? now() : now;
-  const date = value === undefined ? new Date() : new Date(value);
-  if (Number.isNaN(date.getTime())) throw new Error("qq-wiki: refresh clock did not return a valid date");
-  return date.toISOString();
-}
-
-export async function stampIndex(repoRoot, now = () => new Date()) {
-  const indexPath = resolve(repoRoot, "wiki/index.md");
-  let text;
-  try {
-    text = await readFile(indexPath, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") throw new Error("qq-wiki: model pass did not create wiki/index.md");
-    throw error;
-  }
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  const hadFinalNewline = text.endsWith("\n");
-  const lines = text.split(/\r?\n/);
-  if (hadFinalNewline) lines.pop();
-  const titleIndex = lines.findIndex((line) => /^#\s+\S/.test(line));
-  if (titleIndex === -1) throw new Error("qq-wiki: wiki/index.md needs a '# …' title");
-  const withoutOldStamp = lines.filter((line, index) => (
-    index === titleIndex || !/^Refreshed:\s+\S.*$/.test(line)
-  ));
-  const adjustedTitleIndex = withoutOldStamp.findIndex((line) => /^#\s+\S/.test(line));
-  withoutOldStamp.splice(adjustedTitleIndex + 1, 0, `Refreshed: ${refreshedIso(now)}`);
-  await writeFile(indexPath, `${withoutOldStamp.join(eol)}${hadFinalNewline ? eol : ""}`, "utf8");
 }
 
 async function changedWorktreePaths(cloneRoot) {
   const tracked = await git(cloneRoot, ["diff", "--name-only", "--no-renames", "-z", "HEAD"], {
     encoding: null,
   });
-  const untracked = await git(cloneRoot, ["ls-files", "--others", "--exclude-standard", "-z"], {
-    encoding: null,
-  });
+  // No excludes: an ignored file created by the model still violates the boundary.
+  const untracked = await git(cloneRoot, ["ls-files", "--others", "-z"], { encoding: null });
   return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])];
 }
 
-async function requireWikiOnlyWorktree(cloneRoot) {
-  const invalid = (await changedWorktreePaths(cloneRoot)).filter((path) => !isWikiPath(path));
+async function requireIndexOnlyWorktree(cloneRoot) {
+  const paths = await changedWorktreePaths(cloneRoot);
+  const invalid = paths.filter((path) => !isIndexPath(path));
   if (invalid.length > 0) {
-    throw new Error(`qq-wiki: model pass touched paths outside wiki/: ${invalid.join(", ")}`);
+    throw new Error(`qq-index: model pass touched paths other than README.md: ${invalid.join(", ")}`);
+  }
+  return paths;
+}
+
+async function requireReadableIndex(cloneRoot) {
+  let stat;
+  try {
+    stat = await lstat(resolve(cloneRoot, INDEX_PATH));
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      throw new Error("qq-index: model pass did not produce README.md");
+    }
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error("qq-index: README.md must be a regular file");
   }
 }
 
@@ -194,38 +193,27 @@ async function stagedPaths(cloneRoot) {
   return nulPaths(output.stdout);
 }
 
-async function treeMode(cloneRoot, revision, path) {
-  const output = await gitText(cloneRoot, ["ls-tree", revision, "--", path]);
-  return output ? output.split(/\s+/, 1)[0] : "";
-}
-
 async function indexMode(cloneRoot, path) {
   const output = await gitText(cloneRoot, ["ls-files", "--stage", "--", path]);
   return output ? output.split(/\s+/, 1)[0] : "";
 }
 
-async function requireRegularStagedWiki(cloneRoot, sourceRevision) {
+async function requireRegularStagedIndex(cloneRoot) {
   const paths = await stagedPaths(cloneRoot);
-  if (paths.length === 0) throw new Error("qq-wiki: refresh produced no staged wiki changes");
-  for (const path of paths) {
-    if (!isWikiPath(path)) throw new Error(`qq-wiki: staged path is outside wiki/: ${path}`);
-    const currentMode = await indexMode(cloneRoot, path);
-    const oldMode = await treeMode(cloneRoot, sourceRevision, path);
-    const modes = [currentMode, oldMode].filter(Boolean);
-    if (modes.length === 0 || modes.some((mode) => !/^100\d{3}$/.test(mode))) {
-      throw new Error(`qq-wiki: staged wiki path is not a regular file: ${path}`);
-    }
-    if (currentMode) {
-      const stat = await lstat(resolve(cloneRoot, path));
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error(`qq-wiki: staged wiki path is not a regular file: ${path}`);
-      }
-    }
+  if (paths.length !== 1 || paths[0] !== INDEX_PATH) {
+    throw new Error(`qq-index: refresh must stage only README.md (found ${paths.join(", ") || "nothing"})`);
   }
-  return paths;
+  const mode = await indexMode(cloneRoot, INDEX_PATH);
+  if (!/^100\d{3}$/.test(mode)) {
+    throw new Error("qq-index: staged README.md is not a regular file");
+  }
+  const stat = await lstat(resolve(cloneRoot, INDEX_PATH));
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error("qq-index: staged README.md is not a regular file");
+  }
 }
 
-async function commitWiki(cloneRoot) {
+async function commitIndex(cloneRoot) {
   await git(cloneRoot, [
     "-c", `user.name=${BOT_NAME}`,
     "-c", `user.email=${BOT_EMAIL}`,
@@ -252,47 +240,57 @@ async function publish(repoRoot, cloneRoot, sourceRevision, writerCommit) {
   }
 }
 
-/** Refresh and mechanically publish one repository's architect wiki. */
+/** Refresh and mechanically publish one repository's README index. */
 export async function refreshRepository(repoRoot, options = {}) {
   const root = resolve(repoRoot);
   const logger = options.logger ?? console;
   const sourceRevision = await requireMainAndClean(root);
   const lock = await acquireLock(join(await commonGitDir(root), LOCK_NAME));
   if (lock.busy) {
-    logger.log(`qq-wiki: refresh already running for ${root}`);
+    logger.log(`qq-index: refresh already running for ${root}`);
     return { status: "busy" };
   }
 
   let temporaryRoot;
   try {
-    // Recheck after lock acquisition so a waiting caller never clones stale state.
     await requireMainAndClean(root, sourceRevision);
-    temporaryRoot = await mkdtemp(join(tmpdir(), "qq-wiki-refresh-"));
+    temporaryRoot = await mkdtemp(join(tmpdir(), "qq-index-refresh-"));
     const cloneRoot = join(temporaryRoot, "repo");
     await run("git", ["clone", "--local", "--no-hardlinks", "--branch", "main", "--single-branch", root, cloneRoot]);
     const cloneRevision = await gitText(cloneRoot, ["rev-parse", "HEAD"]);
-    if (cloneRevision !== sourceRevision) throw new Error("qq-wiki: isolated clone did not start at source main");
+    if (cloneRevision !== sourceRevision) throw new Error("qq-index: isolated clone did not start at source main");
 
-    const needsModel = await hasSourceCommitsSinceWiki(cloneRoot);
-    if (needsModel) {
-      const modelPass = options.runModelPass ?? defaultRunModelPass;
-      await modelPass(cloneRoot);
+    const needsModel = await hasSourceCommitsSinceIndex(cloneRoot);
+    if (!needsModel) {
+      await requireReadableIndex(cloneRoot);
+      await (options.validateIndex ?? validateIndex)(cloneRoot);
+      logger.log(`qq-index: up to date ${root}`);
+      return { status: "up-to-date", parent: sourceRevision };
     }
-    await stampIndex(cloneRoot, options.now ?? (() => new Date()));
-    await requireWikiOnlyWorktree(cloneRoot);
-    await (options.validateWiki ?? validateWiki)(cloneRoot);
-    await requireWikiOnlyWorktree(cloneRoot);
 
-    // Restore the source revision as the index baseline, then stage only wiki/.
+    const harvest = options.harvestRepository ?? defaultHarvestRepository;
+    const evidencePacket = await harvest(cloneRoot);
+    const modelPass = options.runModelPass ?? defaultRunModelPass;
+    await modelPass(cloneRoot, { evidencePacket });
+    await requireIndexOnlyWorktree(cloneRoot);
+    await requireReadableIndex(cloneRoot);
+    await (options.validateIndex ?? validateIndex)(cloneRoot);
+    const changedPaths = await requireIndexOnlyWorktree(cloneRoot);
+
+    if (changedPaths.length === 0) {
+      logger.log(`qq-index: model produced no index change for ${root}`);
+      return { status: "up-to-date", mode: "model-noop", parent: sourceRevision };
+    }
+
     await git(cloneRoot, ["reset", "--mixed", sourceRevision]);
-    await git(cloneRoot, ["add", "-A", "--", "wiki/"]);
-    await requireRegularStagedWiki(cloneRoot, sourceRevision);
-    const writerCommit = await commitWiki(cloneRoot);
+    await git(cloneRoot, ["add", "--", INDEX_PATH]);
+    await requireRegularStagedIndex(cloneRoot);
+    const writerCommit = await commitIndex(cloneRoot);
     await publish(root, cloneRoot, sourceRevision, writerCommit);
-    logger.log(`qq-wiki: refreshed ${root} (${needsModel ? "model" : "stamp-only"})`);
+    logger.log(`qq-index: refreshed ${root}`);
     return {
       status: "published",
-      mode: needsModel ? "model" : "stamp-only",
+      mode: "model",
       parent: sourceRevision,
       commit: writerCommit,
     };
@@ -307,6 +305,7 @@ export const internals = Object.freeze({
   BOT_EMAIL,
   COMMIT_MESSAGE,
   LOCK_NAME,
-  hasSourceCommitsSinceWiki,
-  isWikiPath,
+  INDEX_PATH,
+  hasSourceCommitsSinceIndex,
+  isIndexPath,
 });

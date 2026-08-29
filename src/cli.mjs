@@ -29,14 +29,14 @@ export function parseRepositoryRegistry(text, options = {}) {
 }
 
 function usage() {
-  return "Usage: qq-wiki-refresh [--repo <path-or-name>]";
+  return "Usage: qq-index-refresh [--repo <path-or-name>]";
 }
 
 export function parseCliArgs(argv) {
   if (argv.length === 0) return { repo: undefined };
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) return { help: true };
   if (argv.length === 2 && argv[0] === "--repo" && argv[1].trim() !== "") return { repo: argv[1] };
-  throw new Error(`qq-wiki: invalid arguments\n${usage()}`);
+  throw new Error(`qq-index: invalid arguments\n${usage()}`);
 }
 
 async function mapBounded(items, concurrency, operation) {
@@ -80,7 +80,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
   const refresh = options.refreshRepository ?? refreshRepository;
   const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
   if (!Number.isInteger(concurrency) || concurrency < 1) {
-    throw new Error("qq-wiki: concurrency must be a positive integer");
+    throw new Error("qq-index: concurrency must be a positive integer");
   }
   const results = await mapBounded(
     selection.repositories,
@@ -91,10 +91,10 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     .map((result, index) => ({ result, repository: selection.repositories[index] }))
     .filter(({ result }) => result.status === "rejected");
   for (const { result, repository } of failures) {
-    logger.error(`qq-wiki: ${repository}: ${result.reason?.message ?? result.reason}`);
+    logger.error(`qq-index: ${repository}: ${result.reason?.message ?? result.reason}`);
   }
   if (failures.length > 0) {
-    throw new Error(`qq-wiki: ${failures.length} refresh${failures.length === 1 ? "" : "es"} failed`);
+    throw new Error(`qq-index: ${failures.length} refresh${failures.length === 1 ? "" : "es"} failed`);
   }
   return results.map((result) => result.value);
 }
