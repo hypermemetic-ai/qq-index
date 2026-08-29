@@ -3,6 +3,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { INDEX_MAX_CHARS } from "../src/index.mjs";
@@ -306,20 +307,55 @@ try {
     assert.equal(plan.env.QQ_DSH_PROVIDER, "openai-codex");
     assert.equal(plan.env.QQ_DSH_MODEL, "gpt-5.6-sol");
     assert.equal(plan.env.QQ_DSH_REASONING_EFFORT, "xhigh");
-    assert.equal(plan.env.DSH_PERMISSION_MODE, "workspace-write");
+    assert.equal(Object.hasOwn(plan.env, "DSH_PERMISSION_MODE"), false);
     assert.equal(plan.env.DSH_HOME, process.env.DSH_HOME);
-    assert.match(plan.env.QQ_WIKI_WRITER_PROMPT, /Forced phases/);
     assert.match(plan.env.QQ_WIKI_MODELS_ROOT, /qq-models$/);
-    assert.match(plan.pluginHref, /\/src\/plugin\.mjs$/);
-    assert.match(plan.overlaySource, /name: "file:\/\/.*\/src\/plugin\.mjs"/);
-    assert.equal(plan.overlaySource.includes("!!js process.env.QQ_WIKI_MODELS_ROOT"), false);
-    assert.equal(plan.overlaySource.includes("__QQ_WIKI_MODELS_ROOT__"), false);
+    assert.match(plan.env.QQ_WIKI_WORKFLOWS_ROOT, /qq-workflows$/);
+
+    const packet = plan.env.QQ_WIKI_WRITER_PROMPT;
+    assert.match(packet, /Forced phases/);
+    assert.match(packet, /only model-facing tool is `bash`/);
+    assert.match(packet, /Every response must call `bash`/);
+    assert.match(packet, /Mini's bounded observation window/);
+    assert.match(packet, /gpt-5\.6-sol/);
+    assert.match(packet, /`xhigh`/);
+    assert.match(packet, /finish by calling bash with exactly\n   `echo COMPLETE_DOCS_AND_EXIT`/);
+    assert.equal((packet.match(/echo COMPLETE_DOCS_AND_EXIT/g) ?? []).length, 1);
+    assert.doesNotMatch(packet, /Its tools are `read`|primary discovery interface/);
+
+    assert.match(plan.modelsPluginHref, /^file:\/\/.*\/qq-models\/src\/plugin\.mjs$/);
+    assert.match(plan.miniDocsPluginHref, /^file:\/\/.*\/qq-workflows\/src\/mini-docs\.mjs$/);
+    assert.match(plan.writerBootPluginHref, /^file:\/\/.*\/src\/writer-boot\.mjs$/);
+    assert.match(plan.overlaySource, /id: qq-wiki-models\n      name: "file:\/\/.*\/src\/plugin\.mjs"/);
+    assert.match(plan.overlaySource, /id: qq-mini-docs\n      name: "file:\/\/.*\/src\/mini-docs\.mjs"/);
+    assert.match(plan.overlaySource, /id: qq-wiki-writer-boot\n      name: "file:\/\/.*\/src\/writer-boot\.mjs"/);
+    assert.equal(plan.overlaySource.includes("__QQ_WIKI_"), false);
+
     const overlay = await readFile(resolve(repositoryRoot, "config/writer.patch.yml"), "utf8");
     assert.match(overlay, /id: approval\n  config:\n    policy: never/);
-    assert.match(overlay, /id: agent-instructions\n  disabled: true/);
-    assert.match(overlay, /id: tool-subagent\n  disabled: true/);
-    assert.match(overlay, /name: __QQ_WIKI_MODELS_ROOT__/);
-    assert.equal(overlay.includes("!!js process.env.QQ_WIKI_MODELS_ROOT"), false);
+    assert.match(overlay, /id: tool-fs\n  disabled: true/);
+    assert.match(overlay, /id: tool-fs-search\n  disabled: true/);
+    assert.doesNotMatch(overlay, /id: tool-bash\n  disabled: true/);
+    assert.match(overlay, /id: qq-mini-docs\n      name: __QQ_WIKI_MINI_DOCS_PLUGIN__/);
+    assert.match(overlay, /id: qq-wiki-writer-boot\n      name: __QQ_WIKI_WRITER_BOOT_PLUGIN__/);
+    assert.equal(overlay.includes("!!js process.env.QQ_WIKI_WORKFLOWS_ROOT"), false);
+  }
+
+  {
+    const repositoryRoot = resolve(new URL("..", import.meta.url).pathname);
+    const workflowsOverride = await mkdtemp(resolve(tmpdir(), "qq-wiki-workflows-override-"));
+    roots.push(workflowsOverride);
+    await put(workflowsOverride, "package.json", JSON.stringify({
+      name: "@hypermemetic-ai/qq-workflows",
+      type: "module",
+    }));
+    await put(workflowsOverride, "src/mini-docs.mjs", "export function miniDocsSetup() {}\n");
+    const plan = modelPassPlan("/tmp/qq-wiki-clone", {
+      packageRoot: repositoryRoot,
+      env: { QQ_WIKI_WORKFLOWS_ROOT: workflowsOverride },
+    });
+    assert.equal(plan.env.QQ_WIKI_WORKFLOWS_ROOT, workflowsOverride);
+    assert.equal(plan.miniDocsPluginHref, new URL("src/mini-docs.mjs", `${pathToFileURL(workflowsOverride).href}/`).href);
   }
 
   console.log("refresh program: ok");

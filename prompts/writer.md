@@ -6,18 +6,19 @@ orientation grounded in current source and tests.
 ## Execution contract
 
 Run this packet as the inner model pass of a headless program, using
-`gpt-5.6-sol` with `xhigh` reasoning. Its tools are `read`, `grep`, `glob`,
-`bash`, `edit`, and `write`. The model pass does not commit or push; the wrapping
-program publishes only after validation.
+`gpt-5.6-sol` with `xhigh` reasoning. The only model-facing tool is `bash`.
+Every response must call `bash`; prose without a bash call is a format error.
+Use bash commands for all discovery and writing.
 
-Use `read`, `grep`, and `glob` as the primary discovery interface. Use `bash`
-only for focused `git log` or `git diff` inspection and to run validation; do
-not use it to dump the tree or as a substitute for reading evidence. Writes
-are allowed only under `wiki/`.
+Bash observations use Mini's bounded observation window. Keep commands focused,
+query paths and symbols selectively, and inspect long evidence in deliberate
+slices rather than dumping whole trees or files. Writes are allowed only under
+`wiki/`. The inner pass must not commit, push, publish, or invoke Land; the
+wrapping qq-wiki program alone may publish after validation.
 
-Read `wiki/index.md` from the repository tree if it exists. Treat it as a
-routing hint, not authority: it may be stale, source and tests win, and wrong
-pages may be deleted. A missing wiki is valid and supplies no existing hint.
+Discover `wiki/index.md` through bash if it exists. Treat it as a routing hint,
+not authority: it may be stale, source and tests win, and wrong pages may be
+deleted. A missing wiki is valid and supplies no existing hint.
 
 ## Forced phases
 
@@ -41,10 +42,12 @@ been named.
    immediately after its title, including when no page content changed. The
    line counts toward the 10,000 Unicode-code-point index cap. A stamp-only
    diff is a successful refresh.
-5. **Mechanical check.** Run `validateWiki(repoRoot)`. Inspect the final diff
-   and require it to contain only regular files under `wiki/`. Any write
-   elsewhere fails the run. Do not commit or push; the wrapping program
-   publishes only after this check passes.
+5. **Mechanical check and exit.** Run `validateWiki(repoRoot)`. Inspect the final
+   diff and require it to contain only regular files under `wiki/`. Any write
+   elsewhere fails the run. Do not commit or push. After validation and the
+   wiki-only diff pass, finish by calling bash with exactly
+   `echo COMPLETE_DOCS_AND_EXIT`. Do not combine the sentinel with another
+   command; Mini Docs intercepts it, concludes the turn, and exits successfully.
 
 Discard scratch notes; they are not pages.
 
@@ -70,4 +73,6 @@ heading skeleton:
 Touch only `wiki/`. Do not edit application code, tests, package metadata,
 prompts, repository instructions, or files elsewhere. A missing wiki is valid
 before first generation. Finish with a wiki-only diff; unchanged page content
-plus the required stamp update is a successful no-op refresh.
+plus the required stamp update is a successful no-op refresh. Never commit from
+the inner pass. The final response is the exact sentinel bash call required in
+phase 5.

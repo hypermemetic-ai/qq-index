@@ -12,10 +12,10 @@ that every local page route resolves to a regular file physically contained in
 - [Orientation convention](convention.md) defines why the cap and routing shape
   exist.
 - [Writer replay](writer.md) produces indexes that satisfy this boundary.
-- qq-workflows owns architect attach injection only; Mini and QA do not
-  receive the index. This package owns the loader, packet, and unattended
-  writer program; a timer that invokes it is neither a workflow nor owned by
-  qq-workflows.
+- qq-workflows owns architect index attachment and the Mini Docs adapter used
+  by the inner writer pass. Workflow Mini implementer and QA children do not
+  receive the index. This package owns the loader and outer publishing program;
+  a timer invoking it directly is not a workflow.
 
 ## Invariants
 
@@ -51,4 +51,4 @@ that every local page route resolves to a regular file physically contained in
   directory.
 - A missing wiki is optional context; a malformed present wiki is not silently
   ignored by validation.
-- Architect attach policy belongs to qq-workflows, not this loader.
+- Architect attach and Mini Docs behavior belong to qq-workflows, not this loader.

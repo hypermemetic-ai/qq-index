@@ -8,6 +8,8 @@ import { spawn } from "node:child_process";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WRITER_TASK = "Refresh this repository's architect orientation wiki.";
 export const MODELS_NAME_TOKEN = "__QQ_WIKI_MODELS_ROOT__";
+export const MINI_DOCS_NAME_TOKEN = "__QQ_WIKI_MINI_DOCS_PLUGIN__";
+export const WRITER_BOOT_NAME_TOKEN = "__QQ_WIKI_WRITER_BOOT_PLUGIN__";
 
 function requirePath(path, label, mode = fsConstants.F_OK) {
   try {
@@ -53,39 +55,67 @@ function resolveDsh(env, root) {
   );
 }
 
-function resolveModels(env, root) {
-  const candidates = env.QQ_WIKI_MODELS_ROOT
-    ? [resolve(env.QQ_WIKI_MODELS_ROOT)]
-    : projectsRoots(env, root).map((projectsRoot) => resolve(projectsRoot, "qq-models"));
+function resolveSiblingPackage(env, root, {
+  envName,
+  sibling,
+  packageName,
+}) {
+  const candidates = env[envName]
+    ? [resolve(env[envName])]
+    : projectsRoots(env, root).map((projectsRoot) => resolve(projectsRoot, sibling));
   const manifestPath = firstPresent(
     candidates.map((candidate) => resolve(candidate, "package.json")),
-    "qq-models package",
+    `${sibling} package`,
   );
   const path = dirname(manifestPath);
   let manifest;
   try {
     manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   } catch (error) {
-    throw new Error(`qq-wiki: cannot read qq-models package at ${path}: ${error.message}`);
+    throw new Error(`qq-wiki: cannot read ${sibling} package at ${path}: ${error.message}`);
   }
-  if (manifest.name !== "@hypermemetic-ai/qq-models") {
-    throw new Error(`qq-wiki: expected @hypermemetic-ai/qq-models at ${path}`);
+  if (manifest.name !== packageName) {
+    throw new Error(`qq-wiki: expected ${packageName} at ${path}`);
   }
   return path;
 }
 
-function resolvePluginHref(modelsRoot) {
-  const plugin = requirePath(resolve(modelsRoot, "src/plugin.mjs"), "qq-models plugin");
-  return pathToFileURL(plugin).href;
+function resolveModels(env, root) {
+  return resolveSiblingPackage(env, root, {
+    envName: "QQ_WIKI_MODELS_ROOT",
+    sibling: "qq-models",
+    packageName: "@hypermemetic-ai/qq-models",
+  });
 }
 
-/** Inline the qq-models plugin specifier. DSH imports entry `name` before !!js. */
-export function resolveWriterOverlay(template, pluginHref) {
-  const needle = `name: ${MODELS_NAME_TOKEN}`;
-  if (!template.includes(needle)) {
-    throw new Error("qq-wiki: writer overlay is missing the qq-models name token");
+function resolveWorkflows(env, root) {
+  return resolveSiblingPackage(env, root, {
+    envName: "QQ_WIKI_WORKFLOWS_ROOT",
+    sibling: "qq-workflows",
+    packageName: "@hypermemetic-ai/qq-workflows",
+  });
+}
+
+function resolvePluginHref(root, relativePath, label) {
+  return pathToFileURL(requirePath(resolve(root, relativePath), label)).href;
+}
+
+/** Inline plugin specifiers. DSH imports entry `name` before evaluating !!js. */
+export function resolveWriterOverlay(template, pluginHrefs) {
+  const replacements = [
+    [MODELS_NAME_TOKEN, pluginHrefs.models, "qq-models"],
+    [MINI_DOCS_NAME_TOKEN, pluginHrefs.miniDocs, "qq-mini-docs"],
+    [WRITER_BOOT_NAME_TOKEN, pluginHrefs.writerBoot, "qq-wiki writer boot"],
+  ];
+  let source = template;
+  for (const [token, href, label] of replacements) {
+    const needle = `name: ${token}`;
+    if (!source.includes(needle)) {
+      throw new Error(`qq-wiki: writer overlay is missing the ${label} name token`);
+    }
+    source = source.replaceAll(needle, `name: ${JSON.stringify(href)}`);
   }
-  return template.replaceAll(needle, `name: ${JSON.stringify(pluginHref)}`);
+  return source;
 }
 
 /** Build the exact headless DSH invocation without spawning it. */
@@ -94,25 +124,34 @@ export function modelPassPlan(cloneRoot, options = {}) {
   const root = resolve(options.packageRoot ?? packageRoot);
   const command = resolveDsh(env, root);
   const modelsRoot = resolveModels(env, root);
+  const workflowsRoot = resolveWorkflows(env, root);
   const overlay = resolve(root, "config/writer.patch.yml");
   requirePath(overlay, "writer overlay");
   const prompt = readFileSync(resolve(root, "prompts/writer.md"), "utf8");
-  const pluginHref = resolvePluginHref(modelsRoot);
-  const overlaySource = resolveWriterOverlay(readFileSync(overlay, "utf8"), pluginHref);
+  const pluginHrefs = {
+    models: resolvePluginHref(modelsRoot, "src/plugin.mjs", "qq-models plugin"),
+    miniDocs: resolvePluginHref(workflowsRoot, "src/mini-docs.mjs", "qq-workflows mini-docs plugin"),
+    writerBoot: resolvePluginHref(root, "src/writer-boot.mjs", "qq-wiki writer boot plugin"),
+  };
+  const overlaySource = resolveWriterOverlay(readFileSync(overlay, "utf8"), pluginHrefs);
 
   return {
     command,
     args: ["--profile", "headless", "--patch", overlay, WRITER_TASK],
     overlaySource,
-    pluginHref,
+    pluginHrefs,
+    pluginHref: pluginHrefs.models,
+    modelsPluginHref: pluginHrefs.models,
+    miniDocsPluginHref: pluginHrefs.miniDocs,
+    writerBootPluginHref: pluginHrefs.writerBoot,
     cwd: resolve(cloneRoot),
     env: {
       ...env,
       QQ_DSH_PROVIDER: "openai-codex",
       QQ_DSH_MODEL: "gpt-5.6-sol",
       QQ_DSH_REASONING_EFFORT: "xhigh",
-      DSH_PERMISSION_MODE: "workspace-write",
       QQ_WIKI_MODELS_ROOT: modelsRoot,
+      QQ_WIKI_WORKFLOWS_ROOT: workflowsRoot,
       QQ_WIKI_WRITER_PROMPT: prompt,
     },
   };

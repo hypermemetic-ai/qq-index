@@ -1,6 +1,6 @@
 # qq-wiki's headless writer overlay. The wrapper supplies the frozen packet in
-# the environment. Plugin `name` is a token: DSH imports it before evaluating
-# !!js, so model-pass inlines a file: URL to qq-models/src/plugin.mjs.
+# the environment. DSH imports plugin `name` before evaluating !!js, so
+# model-pass replaces every token below with an absolute file: URL.
 
 - id: system-prompt
   config:
@@ -27,8 +27,15 @@
   config:
     mode: native
 
-# The filesystem suite registers read/write/edit. With attachments absent it
-# does not register read_image. Search registers grep/glob; bash is separate.
+# Mini Docs wraps the inherited bash tool and restricts the runtime catalog to
+# that replacement. Do not register native filesystem discovery or edit tools.
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+
+# These prompt/presentation bundles are unused by the complete Mini Docs
+# persona. tool-bash deliberately remains enabled for Mini Docs to wrap.
 - id: attachment-local
   disabled: true
 - id: agent-instructions
@@ -38,37 +45,10 @@
 - id: code-runtime
   disabled: true
 
-# Deny every model-facing tool bundle other than tool-fs, tool-fs-search, and
-# tool-bash. Domain services may remain mounted but expose no extra tool.
-- id: tool-pwsh
-  disabled: true
-- id: tool-jobs
-  disabled: true
-- id: tool-skill
-  disabled: true
-- id: tool-subagent-control
-  disabled: true
-- id: tool-subagent-list-agents
-  disabled: true
-- id: tool-subagent
-  disabled: true
-- id: tool-subagent-fork
-  disabled: true
-- id: tool-subagent-report
-  disabled: true
-- id: tool-workflow
-  disabled: true
-- id: tool-todo
-  disabled: true
-- id: tool-goal
-  disabled: true
-- id: tool-ralph
-  disabled: true
-- id: tool-str-replace-editor
-  disabled: true
-- id: tool-web
-  disabled: true
-
 - insert:
     - id: qq-wiki-models
       name: __QQ_WIKI_MODELS_ROOT__
+    - id: qq-mini-docs
+      name: __QQ_WIKI_MINI_DOCS_PLUGIN__
+    - id: qq-wiki-writer-boot
+      name: __QQ_WIKI_WRITER_BOOT_PLUGIN__
