@@ -365,6 +365,10 @@ try {
     const plan = modelPassPlan("/tmp/qq-index-clone", {
       packageRoot: repositoryRoot,
       evidencePacket: EVIDENCE,
+      env: {
+        QQ_INDEX_WRITER_PROMPT: "stale index prompt",
+        QQ_WIKI_WRITER_PROMPT: "stale wiki prompt",
+      },
     });
     assert.equal(typeof plan.then, "undefined");
     assert.equal(plan.cwd, "/tmp/qq-index-clone");
@@ -379,6 +383,7 @@ try {
     assert.match(plan.env.QQ_INDEX_WORKFLOWS_ROOT, /qq-workflows$/);
 
     const prompt = plan.env.QQ_INDEX_WRITER_PROMPT;
+    assert.equal(plan.env.QQ_WIKI_WRITER_PROMPT, prompt);
     assert.match(prompt, /complete and only evidence/);
     assert.match(prompt, /Do not inspect the checkout/);
     assert.match(prompt, /only\s+model-facing tool is Mini Docs/);

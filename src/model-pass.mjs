@@ -155,6 +155,7 @@ export function modelPassPlan(cloneRoot, options = {}) {
       QQ_INDEX_MODELS_ROOT: modelsRoot,
       QQ_INDEX_WORKFLOWS_ROOT: workflowsRoot,
       QQ_INDEX_WRITER_PROMPT: prompt,
+      QQ_WIKI_WRITER_PROMPT: prompt,
     },
   };
 }
