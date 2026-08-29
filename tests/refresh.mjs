@@ -382,7 +382,7 @@ try {
     assert.match(plan.env.QQ_INDEX_WORKFLOWS_ROOT, /qq-workflows$/);
 
     const prompt = plan.env.QQ_INDEX_WRITER_PROMPT;
-    assert.equal(plan.env.QQ_WIKI_WRITER_PROMPT, prompt);
+    assert.equal(Object.hasOwn(plan.env, "QQ_WIKI_WRITER_PROMPT"), false);
     assert.match(prompt, /complete and only evidence/);
     assert.match(prompt, /Do not inspect the checkout/);
     assert.match(prompt, /only\s+model-facing tool is Mini Docs/);

@@ -116,7 +116,10 @@ export function resolveWriterOverlay(template, pluginHrefs) {
 
 /** Build the exact headless DSH invocation without spawning it. */
 export function modelPassPlan(cloneRoot, options = {}) {
-  const env = { ...process.env, ...(options.env ?? {}) };
+  const env = Object.fromEntries(
+    Object.entries({ ...process.env, ...(options.env ?? {}) })
+      .filter(([name]) => !name.startsWith("QQ_WIKI_")),
+  );
   const evidencePacket = options.evidencePacket ?? env.QQ_INDEX_EVIDENCE_PACKET;
   if (typeof evidencePacket !== "string" || evidencePacket.trim() === "") {
     throw new Error("qq-index: model pass requires a non-empty evidence packet");
@@ -151,7 +154,6 @@ export function modelPassPlan(cloneRoot, options = {}) {
       QQ_INDEX_MODELS_ROOT: modelsRoot,
       QQ_INDEX_WORKFLOWS_ROOT: workflowsRoot,
       QQ_INDEX_WRITER_PROMPT: prompt,
-      QQ_WIKI_WRITER_PROMPT: prompt,
     },
   };
 }
