@@ -40,7 +40,17 @@ pub(crate) const MAX_SCOPE_TOKENS: usize = 16;
 pub(crate) const MAX_SCOPE_TOKEN_BYTES: usize = 64;
 const MAX_BATCH_DOCUMENTS: usize = 10_000;
 
-const SCHEMA_SQL: &str = r#"
+struct SchemaObjectDefinition {
+    name: &'static str,
+    object_type: &'static str,
+    sql: &'static str,
+}
+
+const SCHEMA_OBJECTS: &[SchemaObjectDefinition] = &[
+    SchemaObjectDefinition {
+        name: "index_meta",
+        object_type: "table",
+        sql: r#"
 CREATE TABLE index_meta (
     singleton          INTEGER PRIMARY KEY CHECK (singleton = 1),
     generation         INTEGER NOT NULL CHECK (generation >= 0),
@@ -48,20 +58,24 @@ CREATE TABLE index_meta (
     projection_version TEXT NOT NULL,
     schema_fingerprint TEXT NOT NULL
 ) STRICT;
-INSERT INTO index_meta(
-    singleton, generation, source_watermark, projection_version, schema_fingerprint
-)
-VALUES (
-    1, 0, 0, 'qq-session-projection-v1', 'qq-session-index-schema-v1'
-);
-
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "sessions",
+        object_type: "table",
+        sql: r#"
 CREATE TABLE sessions (
     session_id      TEXT PRIMARY KEY,
     workspace_id    TEXT NOT NULL,
     next_seq        INTEGER NOT NULL CHECK (next_seq >= 0),
     header_revision TEXT NOT NULL
 ) STRICT;
-
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "documents",
+        object_type: "table",
+        sql: r#"
 CREATE TABLE documents (
     doc_id             INTEGER PRIMARY KEY,
     session_id         TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -76,9 +90,22 @@ CREATE TABLE documents (
     source_revision    TEXT NOT NULL,
     UNIQUE(session_id, seq)
 ) STRICT;
-CREATE INDEX documents_session_time ON documents(session_id, event_time_unix_ms, seq);
-CREATE INDEX documents_metadata ON documents(workspace_id, surface, event_time_unix_ms, session_id, seq);
-
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "documents_session_time",
+        object_type: "index",
+        sql: "CREATE INDEX documents_session_time ON documents(session_id, event_time_unix_ms, seq);",
+    },
+    SchemaObjectDefinition {
+        name: "documents_metadata",
+        object_type: "index",
+        sql: "CREATE INDEX documents_metadata ON documents(workspace_id, surface, event_time_unix_ms, session_id, seq);",
+    },
+    SchemaObjectDefinition {
+        name: "documents_fts",
+        object_type: "table",
+        sql: r#"
 CREATE VIRTUAL TABLE documents_fts USING fts5(
     body,
     scope_terms,
@@ -86,22 +113,44 @@ CREATE VIRTUAL TABLE documents_fts USING fts5(
     content_rowid='doc_id',
     tokenize='unicode61'
 );
-
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "documents_ai",
+        object_type: "trigger",
+        sql: r#"
 CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
   INSERT INTO documents_fts(rowid, body, scope_terms)
   VALUES (new.doc_id, new.body, new.scope_terms);
 END;
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "documents_ad",
+        object_type: "trigger",
+        sql: r#"
 CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
   INSERT INTO documents_fts(documents_fts, rowid, body, scope_terms)
   VALUES ('delete', old.doc_id, old.body, old.scope_terms);
 END;
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "documents_au",
+        object_type: "trigger",
+        sql: r#"
 CREATE TRIGGER documents_au AFTER UPDATE OF body, scope_terms ON documents BEGIN
   INSERT INTO documents_fts(documents_fts, rowid, body, scope_terms)
   VALUES ('delete', old.doc_id, old.body, old.scope_terms);
   INSERT INTO documents_fts(rowid, body, scope_terms)
   VALUES (new.doc_id, new.body, new.scope_terms);
 END;
-
+"#,
+    },
+    SchemaObjectDefinition {
+        name: "ingest_batches",
+        object_type: "table",
+        sql: r#"
 CREATE TABLE ingest_batches (
     idempotency_key    TEXT PRIMARY KEY,
     payload_fingerprint TEXT NOT NULL,
@@ -110,7 +159,41 @@ CREATE TABLE ingest_batches (
     inserted_documents INTEGER NOT NULL CHECK (inserted_documents >= 0),
     replayed_documents INTEGER NOT NULL CHECK (replayed_documents >= 0)
 ) STRICT;
+"#,
+    },
+];
+
+const INITIAL_METADATA_SQL: &str = r#"
+INSERT INTO index_meta(
+    singleton, generation, source_watermark, projection_version, schema_fingerprint
+)
+VALUES (
+    1, 0, 0, 'qq-session-projection-v1', 'qq-session-index-schema-v1'
+);
 "#;
+
+const FTS_SHADOW_OBJECTS: &[SchemaObjectDefinition] = &[
+    SchemaObjectDefinition {
+        name: "documents_fts_config",
+        object_type: "table",
+        sql: "CREATE TABLE 'documents_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID",
+    },
+    SchemaObjectDefinition {
+        name: "documents_fts_data",
+        object_type: "table",
+        sql: "CREATE TABLE 'documents_fts_data'(id INTEGER PRIMARY KEY, block BLOB)",
+    },
+    SchemaObjectDefinition {
+        name: "documents_fts_docsize",
+        object_type: "table",
+        sql: "CREATE TABLE 'documents_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)",
+    },
+    SchemaObjectDefinition {
+        name: "documents_fts_idx",
+        object_type: "table",
+        sql: "CREATE TABLE 'documents_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+    },
+];
 
 /// Errors fail closed; opening never mutates a foreign or unsupported database.
 #[derive(Debug, Error)]
@@ -234,7 +317,10 @@ impl SessionIndex {
         configure_connection(&connection)?;
         ensure_fts5(&connection)?;
         let transaction = connection.unchecked_transaction()?;
-        transaction.execute_batch(SCHEMA_SQL)?;
+        for object in SCHEMA_OBJECTS {
+            transaction.execute_batch(object.sql)?;
+        }
+        transaction.execute_batch(INITIAL_METADATA_SQL)?;
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -471,28 +557,36 @@ fn validate_identity(connection: &Connection) -> Result<(), IndexError> {
 
 fn validate_schema(connection: &Connection) -> Result<(), IndexError> {
     validate_identity(connection)?;
-    for (object, expected_type) in [
-        ("index_meta", "table"),
-        ("sessions", "table"),
-        ("documents", "table"),
-        ("documents_fts", "table"),
-        ("ingest_batches", "table"),
-        ("documents_session_time", "index"),
-        ("documents_metadata", "index"),
-        ("documents_ai", "trigger"),
-        ("documents_ad", "trigger"),
-        ("documents_au", "trigger"),
-    ] {
-        let object_type: Option<String> = connection
+    for expected in SCHEMA_OBJECTS.iter().chain(FTS_SHADOW_OBJECTS) {
+        let stored: Option<(String, Option<String>)> = connection
             .query_row(
-                "SELECT type FROM sqlite_schema WHERE name = ?1",
-                [object],
-                |row| row.get(0),
+                "SELECT type, sql FROM sqlite_schema WHERE name = ?1",
+                [expected.name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if object_type.as_deref() != Some(expected_type) {
+        let Some((object_type, sql)) = stored else {
             return Err(IndexError::InvalidSchema(format!(
-                "required {expected_type} {object:?} is missing or has the wrong type"
+                "required {} {:?} is missing",
+                expected.object_type, expected.name
+            )));
+        };
+        if object_type != expected.object_type {
+            return Err(IndexError::InvalidSchema(format!(
+                "required {} {:?} has type {object_type:?}",
+                expected.object_type, expected.name
+            )));
+        }
+        let Some(sql) = sql else {
+            return Err(IndexError::InvalidSchema(format!(
+                "required {} {:?} has no stored definition",
+                expected.object_type, expected.name
+            )));
+        };
+        if normalize_schema_sql(&sql) != normalize_schema_sql(expected.sql) {
+            return Err(IndexError::InvalidSchema(format!(
+                "required {} {:?} does not match schema version {SCHEMA_VERSION}",
+                expected.object_type, expected.name
             )));
         }
     }
@@ -511,6 +605,16 @@ fn validate_schema(connection: &Connection) -> Result<(), IndexError> {
         )));
     }
     Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    // These are fixed trusted definitions whose SQL string literals contain no
+    // whitespace, so folding ASCII whitespace cannot alter literal semantics.
+    sql.trim()
+        .trim_end_matches(';')
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn read_metadata(connection: &Connection) -> Result<IndexMetadata, IndexError> {

@@ -182,7 +182,7 @@ fn lifecycle_is_versioned_rejects_foreign_shapes_and_reopens_without_source_work
 }
 
 #[test]
-fn schema_fingerprint_and_required_objects_fail_closed() {
+fn schema_fingerprint_objects_and_definitions_fail_closed() {
     let (_root, path, index) = new_index();
     drop(index);
     let connection = Connection::open(&path).expect("open generated index");
@@ -204,6 +204,36 @@ fn schema_fingerprint_and_required_objects_fail_closed() {
     connection
         .execute("DROP TRIGGER documents_ai", [])
         .expect("remove generated trigger");
+    drop(connection);
+    assert!(matches!(
+        SessionIndex::open(&path),
+        Err(IndexError::InvalidSchema(_))
+    ));
+
+    let (_root, path, index) = new_index();
+    drop(index);
+    let connection = Connection::open(&path).expect("open generated index");
+    connection
+        .execute_batch(
+            "DROP TRIGGER documents_ai;
+             CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN SELECT 1; END;",
+        )
+        .expect("replace generated trigger with same-name no-op");
+    drop(connection);
+    assert!(matches!(
+        SessionIndex::open(&path),
+        Err(IndexError::InvalidSchema(_))
+    ));
+
+    let (_root, path, index) = new_index();
+    drop(index);
+    let connection = Connection::open(&path).expect("open generated index");
+    connection
+        .execute_batch(
+            "DROP INDEX documents_metadata;
+             CREATE INDEX documents_metadata ON documents(seq);",
+        )
+        .expect("replace generated index with wrong same-name index");
     drop(connection);
     assert!(matches!(
         SessionIndex::open(&path),
