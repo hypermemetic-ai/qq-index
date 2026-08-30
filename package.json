@@ -10,6 +10,7 @@
   },
   "files": [
     "bin/",
+    "benchmarks/",
     "config/",
     "docs/",
     "systemd/",
@@ -18,7 +19,9 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
+    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs",
+    "benchmark:session-history": "python3 benchmarks/session_history_fts5.py",
+    "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled"
   },
   "bin": {
     "qq-index-refresh": "bin/qq-index-refresh",
