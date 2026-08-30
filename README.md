@@ -73,9 +73,8 @@ With no `--repo`, the CLI reads the bounded registry in
 [`config/repositories`](config/repositories) and refreshes at concurrency three.
 The packaged oneshot and schedule are
 [`systemd/user/qq-index.service`](systemd/user/qq-index.service) and
-[`systemd/user/qq-index.timer`](systemd/user/qq-index.timer). The checkout folder
-remains `qq-wiki`, so the service’s working directory deliberately retains that
-physical path even though the product and executable are `qq-index`.
+[`systemd/user/qq-index.timer`](systemd/user/qq-index.timer). The service expects
+the checkout at the canonical `%h/projects/qq-index` path.
 
 ## Change map
 

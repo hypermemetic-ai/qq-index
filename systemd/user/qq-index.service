@@ -3,8 +3,8 @@ Description=Refresh repository README indexes
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/projects/qq-wiki
+WorkingDirectory=%h/projects/qq-index
 UMask=0077
 Environment="PATH=%h/.local/bin:%h/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=%h/projects/qq-wiki/bin/qq-index-refresh
+ExecStart=%h/projects/qq-index/bin/qq-index-refresh
 TimeoutStartSec=12h
