@@ -135,6 +135,7 @@ function generatedSearch() {
       authorizedScopeTokens: ["scopegenerated"],
       workspaceIds: [],
       surfaceAllowList: ["conversation"],
+      eventTypeAllowList: ["message/generated"],
       includeSessionIds: ["node-generated-session"],
       excludeSessionIds: [],
       sessionSeqBounds: [{
@@ -204,6 +205,12 @@ try {
     () => firstClient.health({ unknown: true }),
     (error) => error.code === "invalid_argument",
   );
+  assert.throws(
+    () => firstClient.sourceState({
+      sessionIds: Array.from({ length: 33 }, (_, index) => `bounded-${index}`),
+    }),
+    (error) => error.code === "invalid_argument",
+  );
   const health = await firstClient.health({ timeoutMs: 1_000 });
   assert.equal(health.protocolVersion, SESSION_INDEX_PROTOCOL_VERSION);
   assert.equal(health.generation, "0");
@@ -242,7 +249,26 @@ try {
     replayedDocuments: 0,
     batchReplayed: false,
   });
-  assertPersistedSearch(await firstClient.searchBatch(generatedSearch(), { timeoutMs: 2_000 }));
+  const searchClient = await connectSessionIndexClient({ socketPath, timeoutMs: 2_000 });
+  assert.deepEqual(
+    await searchClient.sourceState({
+      sessionIds: ["missing-node-generated", "node-generated-session"],
+    }),
+    {
+      type: "sourceState",
+      version: "source-state-response-v1",
+      generation: "1",
+      sourceWatermark: "1",
+      sessions: [{
+        sessionId: "node-generated-session",
+        nextSeq: "1",
+        workspaceId: "workspace-generated",
+        headerRevision: "node-generated-source-revision-1",
+      }],
+    },
+  );
+  assertPersistedSearch(await searchClient.searchBatch(generatedSearch(), { timeoutMs: 2_000 }));
+  await searchClient.close();
   await firstClient.shutdown({ timeoutMs: 1_000 });
   await boundedExit(firstDaemon, "create daemon");
   await assert.rejects(stat(socketPath), { code: "ENOENT" });
@@ -252,6 +278,11 @@ try {
   const restartedHealth = await restartedClient.health({ timeoutMs: 1_000 });
   assert.equal(restartedHealth.generation, "1");
   assert.equal(restartedHealth.sourceWatermark, "1");
+  const restartedState = await restartedClient.sourceState({
+    sessionIds: ["node-generated-session"],
+  });
+  assert.equal(restartedState.sessions[0].nextSeq, "1");
+  assert.equal(restartedState.sessions[0].headerRevision, "node-generated-source-revision-1");
   assertPersistedSearch(
     await restartedClient.searchBatch(generatedSearch(), { timeoutMs: 2_000 }),
   );

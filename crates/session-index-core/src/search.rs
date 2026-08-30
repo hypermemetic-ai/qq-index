@@ -5,9 +5,10 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, TransactionBehavior, params_from_iter};
 
 use crate::{
-    IndexError, MAX_SCOPE_TOKEN_BYTES, MAX_SCOPE_TOKENS, MAX_SESSION_ID_BYTES, MAX_SURFACE_BYTES,
-    MAX_WORKSPACE_BYTES, canonical_scope_terms, i64_to_u64, quoted_fts_phrase, read_metadata_tx,
-    u64_to_i64, validate_scope_token, validate_text,
+    IndexError, MAX_EVENT_TYPE_BYTES, MAX_SCOPE_TOKEN_BYTES, MAX_SCOPE_TOKENS,
+    MAX_SESSION_ID_BYTES, MAX_SURFACE_BYTES, MAX_WORKSPACE_BYTES, canonical_scope_terms,
+    i64_to_u64, quoted_fts_phrase, read_metadata_tx, u64_to_i64, validate_scope_token,
+    validate_text,
 };
 
 /// Semantic version of [`SearchBatchV1`]. Transport wrappers must reject other versions.
@@ -27,6 +28,8 @@ const MAX_LITERALS_V1: usize = 5;
 const MAX_LITERAL_BYTES_V1: usize = 500;
 const MAX_WORKSPACE_FILTERS_V1: usize = 32;
 const MAX_SURFACE_FILTERS_V1: usize = 32;
+/// Maximum event types accepted by one search filter.
+pub const MAX_EVENT_TYPE_FILTERS_V1: usize = 32;
 const MAX_SESSION_FILTERS_V1: usize = 128;
 const MAX_SESSION_SEQ_BOUNDS_V1: usize = 128;
 
@@ -57,6 +60,8 @@ pub struct SearchFiltersV1 {
     pub workspace_ids: Vec<String>,
     /// Optional defense-in-depth surface allow list; empty means unrestricted.
     pub surface_allow_list: Vec<String>,
+    /// Optional event-type allow list; empty means unrestricted.
+    pub event_type_allow_list: Vec<String>,
     /// Optional session allow list; empty means unrestricted.
     pub include_session_ids: Vec<String>,
     /// Session deny list, applied in addition to any allow list.
@@ -245,6 +250,13 @@ fn search_one_literal(
         &mut bindings,
         "d.surface",
         &filters.surface_allow_list,
+        false,
+    );
+    append_text_list_filter(
+        &mut sql,
+        &mut bindings,
+        "d.event_type",
+        &filters.event_type_allow_list,
         false,
     );
     append_text_list_filter(
@@ -463,6 +475,12 @@ fn validate_search(request: &SearchBatchV1) -> Result<(), IndexError> {
         &request.filters.surface_allow_list,
         MAX_SURFACE_FILTERS_V1,
         MAX_SURFACE_BYTES,
+    )?;
+    validate_text_filter(
+        "event-type filter",
+        &request.filters.event_type_allow_list,
+        MAX_EVENT_TYPE_FILTERS_V1,
+        MAX_EVENT_TYPE_BYTES,
     )?;
     validate_text_filter(
         "included session",
