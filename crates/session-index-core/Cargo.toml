@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Derived SQLite FTS5 storage core for qq session-history indexing"
 publish = false
 
+[features]
+test-hooks = []
+
 [dependencies]
 rusqlite.workspace = true
 thiserror.workspace = true

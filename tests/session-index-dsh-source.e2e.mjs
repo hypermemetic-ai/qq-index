@@ -49,6 +49,8 @@ function spawnDaemon(binary) {
     "--socket", socketPath,
     "--database", databasePath,
     "--create",
+    "--readers", "2",
+    "--queue-capacity", "4",
   ], { stdio: ["ignore", "ignore", "pipe"] });
   children.add(child);
   let stderr = "";
@@ -327,15 +329,25 @@ try {
   // The adapter retains its ingest connection while this independently accepted
   // client reads source state and searches through the real daemon.
   const searchClient = await connectBoundedly(daemon);
+  const secondSearchClient = await connectBoundedly(daemon);
+  assert.equal((await searchClient.health()).capabilities.readerCount, 2);
   const bootState = await searchClient.sourceState({ sessionIds: [sessionId] });
   assert.equal(bootState.sessions[0].nextSeq, "5");
   assert.equal(bootState.sourceWatermark, "3");
-  const fenced = await searchClient.searchBatch(searchRequest(
-    fencedLiteral,
-    ["message/user", "message/assistant"],
-    ["current", "shadowed"],
-  ));
+  const [fenced, simultaneousInitial] = await Promise.all([
+    searchClient.searchBatch(searchRequest(
+      fencedLiteral,
+      ["message/user", "message/assistant"],
+      ["current", "shadowed"],
+    )),
+    secondSearchClient.searchBatch(searchRequest(
+      initialLiteral,
+      ["message/user"],
+      ["current"],
+    )),
+  ]);
   assert.equal(fenced.fused[0].sessionId, sessionId, "fenced live event was lost");
+  assert.equal(simultaneousInitial.fused[0].sessionId, sessionId);
   const toolExists = await searchClient.searchBatch(searchRequest(
     toolLiteral,
     ["tool/result"],
@@ -402,6 +414,7 @@ try {
   ));
   assert.equal(staleStillDerived.fused[0].sessionId, sessionId);
 
+  await secondSearchClient.close();
   await searchClient.shutdown({ timeoutMs: 2_000 });
   await boundedExit(daemon);
   console.log("session-index DSH source generated E2E: ok");

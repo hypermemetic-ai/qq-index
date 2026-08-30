@@ -55,6 +55,10 @@ function spawnDaemon(binary, mode, targetSocket = socketPath, targetDatabase = d
     "--database",
     targetDatabase,
     mode,
+    "--readers",
+    "2",
+    "--queue-capacity",
+    "2",
   ], { stdio: ["ignore", "ignore", "pipe"] });
   children.add(child);
   let stderr = "";
@@ -148,6 +152,59 @@ function generatedSearch() {
   };
 }
 
+function broadBatch(batchIndex, count = 1_000) {
+  const sourceWatermark = batchIndex + 2;
+  return {
+    idempotencyKey: `node-broad-batch-${batchIndex}`,
+    payloadFingerprint: `node-broad-payload-${batchIndex}`,
+    sourceWatermark: String(sourceWatermark),
+    documents: Array.from({ length: count }, (_, documentIndex) => {
+      const ordinal = batchIndex * count + documentIndex;
+      return {
+        sessionId: `node-broad-session-${ordinal}`,
+        seq: "0",
+        eventTimeUnixMs: 1_700_100_000_000 + ordinal,
+        eventType: "message/generated",
+        surface: "conversation",
+        workspaceId: "workspace-generated",
+        scopeTokens: ["scopegenerated"],
+        body: `generated broad cancellation workload ${"padding ".repeat(48)}${ordinal}`,
+        fingerprint: `node-broad-fingerprint-${ordinal}`,
+        sourceRevision: `node-broad-revision-${ordinal}`,
+      };
+    }),
+  };
+}
+
+function broadSearch() {
+  return {
+    version: SESSION_INDEX_SEARCH_VERSION,
+    literals: ["generated", "broad", "cancellation", "workload", "padding"],
+    perSourceDepth: 100,
+    finalLimit: 100,
+    filters: {
+      authorizedScopeTokens: ["scopegenerated"],
+      workspaceIds: ["workspace-generated"],
+      surfaceAllowList: ["conversation"],
+      eventTypeAllowList: ["message/generated"],
+      includeSessionIds: [],
+      excludeSessionIds: [],
+      sessionSeqBounds: [],
+    },
+    minimumSourceWatermark: "31",
+  };
+}
+
+async function waitForActiveReaders(client, minimum, pending, description) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline && !pending.settled) {
+    const health = await client.health({ timeoutMs: 500 });
+    if (health.capabilities.activeReaders >= minimum) return health;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+  }
+  assert.fail(`${description} did not expose ${minimum} active readers before settling`);
+}
+
 function assertPersistedSearch(response) {
   assert.equal(response.version, "search-batch-response-v1");
   assert.deepEqual(response.snapshot, {
@@ -217,10 +274,19 @@ try {
   assert.equal(health.sourceWatermark, "0");
   assert.deepEqual(health.capabilities, {
     localUnixSocket: true,
-    serializedRequests: true,
-    activeSqliteInterrupt: false,
+    serializedRequests: false,
+    serializedWriter: true,
+    activeSqliteInterrupt: true,
+    progressDeadlineSupport: true,
+    readerCount: 2,
+    queueCapacity: 2,
+    readerRetirements: 0,
+    activeReaders: 0,
+    peakActiveReaders: 0,
     maxFrameBytes: 1_048_576,
   });
+  assert.equal(health.cancelRequestVersion, "cancel-v1");
+  assert.equal(health.cancelResponseVersion, "cancel-response-v1");
 
   const socketMetadata = await stat(socketPath);
   assert.equal(socketMetadata.isSocket(), true);
@@ -286,6 +352,72 @@ try {
   assertPersistedSearch(
     await restartedClient.searchBatch(generatedSearch(), { timeoutMs: 2_000 }),
   );
+
+  // Build only generated broad data. FTS ranking must inspect enough equal
+  // postings to keep requests active while the pool/control path is observed.
+  for (let batchIndex = 0; batchIndex < 30; batchIndex += 1) {
+    await restartedClient.applyBatch(broadBatch(batchIndex), { timeoutMs: 5_000 });
+  }
+  const concurrentA = await connectSessionIndexClient({ socketPath, timeoutMs: 5_000 });
+  const concurrentB = await connectSessionIndexClient({ socketPath, timeoutMs: 5_000 });
+  const overlap = await Promise.all([
+    concurrentA.searchBatch(broadSearch(), { timeoutMs: 5_000 }),
+    concurrentB.searchBatch(broadSearch(), { timeoutMs: 5_000 }),
+  ]);
+  assert.equal(overlap[0].snapshot.generation, "31");
+  assert.equal(overlap[1].snapshot.generation, "31");
+  const overlapHealth = await restartedClient.health({ timeoutMs: 1_000 });
+  assert.ok(
+    overlapHealth.capabilities.peakActiveReaders >= 2,
+    `reader pool did not overlap: ${JSON.stringify(overlapHealth.capabilities)}`,
+  );
+
+  const controller = new AbortController();
+  const active = { settled: false };
+  const cancellable = concurrentA.searchBatch(broadSearch(), {
+    timeoutMs: 5_000,
+    signal: controller.signal,
+  });
+  cancellable.then(
+    () => { active.settled = true; },
+    () => { active.settled = true; },
+  );
+  await waitForActiveReaders(restartedClient, 1, active, "generated cancellable search");
+  const cancelledAt = performance.now();
+  controller.abort(new Error("generated active cancellation"));
+  await assert.rejects(
+    cancellable,
+    (error) => error.code === "cancelled",
+  );
+  const cancellationAckMs = performance.now() - cancelledAt;
+  assert.ok(
+    cancellationAckMs < 100,
+    `active cancellation acknowledgement was ${cancellationAckMs.toFixed(3)} ms`,
+  );
+  assert.equal(
+    (await concurrentA.searchBatch(broadSearch(), { timeoutMs: 5_000 })).snapshot.generation,
+    "31",
+  );
+
+  // Occupy both readers, then submit a third generated search with a short
+  // absolute deadline. Queue time is part of the deadline and cancellation is
+  // acknowledged without entering SQLite.
+  const holders = { settled: false };
+  const holderA = concurrentA.searchBatch(broadSearch(), { timeoutMs: 5_000 });
+  const holderB = concurrentB.searchBatch(broadSearch(), { timeoutMs: 5_000 });
+  Promise.allSettled([holderA, holderB]).then(() => { holders.settled = true; });
+  await waitForActiveReaders(restartedClient, 2, holders, "generated queued-deadline holders");
+  const queuedStarted = performance.now();
+  await assert.rejects(
+    restartedClient.searchBatch(broadSearch(), { deadlineUnixMs: Date.now() + 50 }),
+    (error) => error.code === "deadline_exceeded",
+  );
+  assert.ok(performance.now() - queuedStarted < 200, "queued deadline was not bounded");
+  await Promise.all([holderA, holderB]);
+  await concurrentA.close();
+  await concurrentB.close();
+
+  console.log(`generated active cancellation acknowledgement: ${cancellationAckMs.toFixed(3)} ms`);
   await restartedClient.shutdown({ timeoutMs: 1_000 });
   await boundedExit(restartedDaemon, "restarted daemon");
 

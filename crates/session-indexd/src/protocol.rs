@@ -15,6 +15,8 @@ pub const HEALTH_RESPONSE_VERSION: &str = "health-response-v1";
 pub const SHUTDOWN_RESPONSE_VERSION: &str = "shutdown-response-v1";
 pub const SOURCE_STATE_VERSION_V1: &str = "source-state-v1";
 pub const SOURCE_STATE_RESPONSE_VERSION_V1: &str = "source-state-response-v1";
+pub const CANCEL_VERSION_V1: &str = "cancel-v1";
+pub const CANCEL_RESPONSE_VERSION_V1: &str = "cancel-response-v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_WIRE_DOCUMENTS: usize = 1024;
@@ -46,6 +48,11 @@ pub(crate) enum WireOperation {
         version: String,
         batch: WireMutationBatch,
     },
+    Cancel {
+        version: String,
+        target_request_id: String,
+        reason: WireCancelReason,
+    },
     SearchBatch {
         version: String,
         literals: Vec<String>,
@@ -56,6 +63,14 @@ pub(crate) enum WireOperation {
         minimum_source_watermark: Option<String>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WireCancelReason {
+    Caller,
+    Deadline,
+    Disconnect,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +136,14 @@ pub(crate) enum ProtocolError {
     InvalidRequest(String),
     #[error("request deadline exceeded")]
     DeadlineExceeded,
+    #[error("request was cancelled")]
+    Cancelled,
+    #[error("bounded daemon admission rejected the request")]
+    AdmissionRejected,
+    #[error("requestId is already queued or active")]
+    DuplicateRequestId,
+    #[error("daemon storage worker is unavailable")]
+    StorageUnavailable,
     #[error("shutdown is restricted to a client running as the daemon owner")]
     Forbidden,
     #[error(transparent)]
@@ -134,6 +157,10 @@ impl ProtocolError {
             Self::UnsupportedVersion(_) => "unsupported_version",
             Self::InvalidRequest(_) => "invalid_request",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Cancelled => "cancelled",
+            Self::AdmissionRejected => "admission_rejected",
+            Self::DuplicateRequestId => "invalid_request",
+            Self::StorageUnavailable => "storage_error",
             Self::Forbidden => "forbidden",
             Self::Core(error) => match error {
                 IndexError::InvalidMutation(_) | IndexError::InvalidSearch(_) => "invalid_request",
@@ -152,6 +179,9 @@ impl ProtocolError {
         matches!(
             self,
             Self::DeadlineExceeded
+                | Self::Cancelled
+                | Self::AdmissionRejected
+                | Self::StorageUnavailable
                 | Self::Core(IndexError::SourceWatermarkUnavailable { .. })
                 | Self::Core(IndexError::Sqlite(_))
         )
@@ -163,6 +193,17 @@ pub(crate) fn parse_request(frame: &[u8]) -> Result<RequestEnvelope, ProtocolErr
         .map_err(|error| ProtocolError::Malformed(error.to_string()))?;
     validate_operation_keys(frame, &request.operation)?;
     validate_request_id(&request.request_id)?;
+    if let WireOperation::Cancel {
+        target_request_id, ..
+    } = &request.operation
+    {
+        validate_request_id(target_request_id)?;
+        if target_request_id == &request.request_id {
+            return Err(ProtocolError::InvalidRequest(
+                "cancel requestId must differ from targetRequestId".to_owned(),
+            ));
+        }
+    }
     if request.deadline_unix_ms == 0 {
         return Err(ProtocolError::InvalidRequest(
             "deadlineUnixMs must be a positive integer".to_owned(),
@@ -180,6 +221,7 @@ fn validate_operation_keys(frame: &[u8], operation: &WireOperation) -> Result<()
         .ok_or_else(|| ProtocolError::Malformed("operation must be an object".to_owned()))?;
     let allowed: &[&str] = match operation {
         WireOperation::Health | WireOperation::Shutdown => &["type"],
+        WireOperation::Cancel { .. } => &["type", "version", "targetRequestId", "reason"],
         WireOperation::SourceState { .. } => &["type", "version", "sessionIds"],
         WireOperation::ApplyBatch { .. } => &["type", "version", "batch"],
         WireOperation::SearchBatch { .. } => &[
@@ -362,7 +404,14 @@ pub(crate) fn error_envelope(request_id: &str, error: &ProtocolError) -> Value {
     })
 }
 
-pub(crate) fn health_response(metadata: &IndexMetadata) -> Value {
+pub(crate) fn health_response(
+    metadata: &IndexMetadata,
+    reader_count: usize,
+    queue_capacity: usize,
+    reader_retirements: u64,
+    active_readers: u64,
+    peak_active_readers: u64,
+) -> Value {
     json!({
         "type": "health",
         "version": HEALTH_RESPONSE_VERSION,
@@ -372,14 +421,37 @@ pub(crate) fn health_response(metadata: &IndexMetadata) -> Value {
         "projectionVersion": metadata.projection_version,
         "searchRequestVersion": SEARCH_BATCH_VERSION_V1,
         "searchResponseVersion": SEARCH_BATCH_RESPONSE_VERSION_V1,
+        "cancelRequestVersion": CANCEL_VERSION_V1,
+        "cancelResponseVersion": CANCEL_RESPONSE_VERSION_V1,
         "generation": metadata.generation.to_string(),
         "sourceWatermark": metadata.source_watermark.to_string(),
         "capabilities": {
             "localUnixSocket": true,
-            "serializedRequests": true,
-            "activeSqliteInterrupt": false,
+            "serializedRequests": false,
+            "serializedWriter": true,
+            "activeSqliteInterrupt": true,
+            "progressDeadlineSupport": true,
+            "readerCount": reader_count,
+            "queueCapacity": queue_capacity,
+            "readerRetirements": reader_retirements,
+            "activeReaders": active_readers,
+            "peakActiveReaders": peak_active_readers,
             "maxFrameBytes": MAX_FRAME_BYTES,
         },
+    })
+}
+
+pub(crate) fn cancel_response(
+    target_request_id: &str,
+    state: &str,
+    cancellation_requested: bool,
+) -> Value {
+    json!({
+        "type": "cancel",
+        "version": CANCEL_RESPONSE_VERSION_V1,
+        "targetRequestId": target_request_id,
+        "state": state,
+        "cancellationRequested": cancellation_requested,
     })
 }
 

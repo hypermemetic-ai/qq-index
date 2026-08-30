@@ -8,18 +8,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use qq_session_index_core::SessionIndex;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::protocol::{
-    MAX_FRAME_BYTES, MUTATION_BATCH_VERSION, ProtocolError, RequestEnvelope,
-    SOURCE_STATE_VERSION_V1, WireOperation, error_envelope, health_response, into_core_search,
-    parse_request, receipt_response, require_operation_version, require_protocol_version,
-    search_response, shutdown_response, source_state_response, success_envelope,
+    CANCEL_VERSION_V1, MAX_FRAME_BYTES, MUTATION_BATCH_VERSION, ProtocolError, RequestEnvelope,
+    SOURCE_STATE_VERSION_V1, WireCancelReason, WireOperation, cancel_response, error_envelope,
+    health_response, into_core_search, parse_request, receipt_response, require_operation_version,
+    require_protocol_version, search_response, shutdown_response, source_state_response,
+    success_envelope,
 };
+use crate::runtime::{CancelReason, Coordinator, Runtime, now_unix_ms};
 
 static SIGNAL_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
@@ -40,6 +42,8 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub database_path: PathBuf,
     pub database_mode: DatabaseMode,
+    pub readers: usize,
+    pub queue_capacity: usize,
 }
 
 #[derive(Debug, Error)]
@@ -108,10 +112,17 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
 
     // Bind first: an unsafe pre-existing socket target must not create or open a database.
     let (listener, _socket_guard) = bind_private_socket(&config.socket_path)?;
-    let index = Arc::new(match config.database_mode {
+    let writer = match config.database_mode {
         DatabaseMode::Create => SessionIndex::create(&config.database_path)?,
         DatabaseMode::Open => SessionIndex::open(&config.database_path)?,
-    });
+    };
+    let runtime = Runtime::start(
+        writer,
+        &config.database_path,
+        config.readers,
+        config.queue_capacity,
+    )?;
+    let coordinator = runtime.coordinator();
 
     listener.set_nonblocking(true).map_err(|error| {
         ServerError::io("setting nonblocking mode on", &config.socket_path, error)
@@ -128,10 +139,10 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
                     drop(stream);
                     continue;
                 }
-                let client_index = Arc::clone(&index);
+                let client_coordinator = Arc::clone(&coordinator);
                 let handle = thread::Builder::new()
                     .name("qq-session-index-client".to_owned())
-                    .spawn(move || match handle_client(stream, &client_index) {
+                    .spawn(move || match handle_client(stream, &client_coordinator) {
                         Ok(true) => SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst),
                         Ok(false) => {}
                         Err(error) => {
@@ -162,6 +173,8 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
     for client in clients {
         let _ = client.join();
     }
+    drop(coordinator);
+    runtime.shutdown();
     Ok(())
 }
 
@@ -192,6 +205,22 @@ fn validate_paths(config: &ServerConfig) -> Result<(), ServerError> {
         return Err(ServerError::InvalidConfig(
             "socket and database paths must differ".to_owned(),
         ));
+    }
+    if !(crate::cli::MIN_READERS..=crate::cli::MAX_READERS).contains(&config.readers) {
+        return Err(ServerError::InvalidConfig(format!(
+            "reader count must be {}..={}",
+            crate::cli::MIN_READERS,
+            crate::cli::MAX_READERS
+        )));
+    }
+    if !(crate::cli::MIN_QUEUE_CAPACITY..=crate::cli::MAX_QUEUE_CAPACITY)
+        .contains(&config.queue_capacity)
+    {
+        return Err(ServerError::InvalidConfig(format!(
+            "queue capacity must be {}..={}",
+            crate::cli::MIN_QUEUE_CAPACITY,
+            crate::cli::MAX_QUEUE_CAPACITY
+        )));
     }
     Ok(())
 }
@@ -304,7 +333,7 @@ fn install_signal_handlers() -> Result<(), ServerError> {
     Ok(())
 }
 
-fn handle_client(stream: UnixStream, index: &SessionIndex) -> Result<bool, ServerError> {
+fn handle_client(stream: UnixStream, coordinator: &Coordinator) -> Result<bool, ServerError> {
     let owner_is_peer = peer_has_daemon_uid(&stream);
     stream
         .set_read_timeout(Some(CLIENT_READ_POLL))
@@ -340,7 +369,7 @@ fn handle_client(stream: UnixStream, index: &SessionIndex) -> Result<bool, Serve
                     }
                 };
                 let request_id = request.request_id.clone();
-                match dispatch(request, index, owner_is_peer) {
+                match dispatch(request, coordinator, owner_is_peer) {
                     Ok((response, should_shutdown)) => {
                         write_value(reader.get_mut(), &success_envelope(&request_id, response))?;
                         if should_shutdown {
@@ -361,26 +390,56 @@ fn handle_client(stream: UnixStream, index: &SessionIndex) -> Result<bool, Serve
 
 fn dispatch(
     request: RequestEnvelope,
-    index: &SessionIndex,
+    coordinator: &Coordinator,
     owner_is_peer: bool,
 ) -> Result<(Value, bool), ProtocolError> {
     require_protocol_version(&request.protocol_version)?;
     check_deadline(request.deadline_unix_ms)?;
 
     let (response, should_shutdown) = match request.operation {
-        WireOperation::Health => (health_response(&index.metadata()?), false),
+        WireOperation::Health => {
+            let metadata = coordinator.metadata(request.deadline_unix_ms)?;
+            (
+                health_response(
+                    &metadata,
+                    coordinator.reader_count(),
+                    coordinator.queue_capacity(),
+                    coordinator.reader_retirements(),
+                    coordinator.active_readers(),
+                    coordinator.peak_active_readers(),
+                ),
+                false,
+            )
+        }
         WireOperation::SourceState {
             version,
             session_ids,
         } => {
             require_operation_version(&version, SOURCE_STATE_VERSION_V1)?;
-            let state = index.source_state_v1(&session_ids)?;
+            let state = coordinator.source_state(request.deadline_unix_ms, session_ids)?;
             (source_state_response(&state), false)
         }
         WireOperation::ApplyBatch { version, batch } => {
             require_operation_version(&version, MUTATION_BATCH_VERSION)?;
-            let receipt = index.apply_batch(&batch.into_core()?)?;
+            let receipt = coordinator.apply_batch(request.deadline_unix_ms, batch.into_core()?)?;
             (receipt_response(&receipt), false)
+        }
+        WireOperation::Cancel {
+            version,
+            target_request_id,
+            reason,
+        } => {
+            require_operation_version(&version, CANCEL_VERSION_V1)?;
+            let reason = match reason {
+                WireCancelReason::Caller => CancelReason::Caller,
+                WireCancelReason::Deadline => CancelReason::Deadline,
+                WireCancelReason::Disconnect => CancelReason::Disconnect,
+            };
+            let outcome = coordinator.cancel(&target_request_id, reason)?;
+            (
+                cancel_response(&target_request_id, outcome.as_str(), outcome.requested()),
+                false,
+            )
         }
         WireOperation::SearchBatch {
             version,
@@ -398,7 +457,11 @@ fn dispatch(
                 filters,
                 minimum_source_watermark,
             )?;
-            let response = index.search_batch_v1(&core_request)?;
+            let response = coordinator.search(
+                request.request_id.clone(),
+                request.deadline_unix_ms,
+                core_request,
+            )?;
             (search_response(&response), false)
         }
         WireOperation::Shutdown => {
@@ -421,15 +484,6 @@ fn check_deadline(deadline_unix_ms: u64) -> Result<(), ProtocolError> {
     } else {
         Ok(())
     }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn peer_has_daemon_uid(stream: &UnixStream) -> bool {
@@ -607,6 +661,8 @@ mod tests {
             socket_path: PathBuf::from("index.sock"),
             database_path: PathBuf::from("index.db"),
             database_mode: DatabaseMode::Create,
+            readers: 2,
+            queue_capacity: 8,
         };
         assert!(validate_paths(&relative).is_err());
     }
