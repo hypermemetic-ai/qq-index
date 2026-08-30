@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -88,6 +89,32 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         database_mode: DatabaseMode::Create,
     };
     let daemon = start(create_config);
+
+    // A client can abort while the serialized daemon is executing its request. Refusing the
+    // response before terminating the frame makes the server-side write fail deterministically.
+    // That connection failure must not take down the listener or the healthy index.
+    let mut abandoned = connect_bounded(&socket);
+    let abandoned_request = json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "abandoned-health",
+        "deadlineUnixMs": DEADLINE,
+        "operation": { "type": "health" },
+    });
+    abandoned
+        .write_all(
+            serde_json::to_string(&abandoned_request)
+                .expect("serialize abandoned request")
+                .as_bytes(),
+        )
+        .expect("write abandoned request body");
+    abandoned
+        .shutdown(Shutdown::Read)
+        .expect("refuse abandoned response");
+    abandoned
+        .write_all(b"\n")
+        .expect("finish abandoned request frame");
+    drop(abandoned);
+
     let stream = connect_bounded(&socket);
     let socket_metadata = fs::symlink_metadata(&socket).expect("socket metadata");
     assert!(socket_metadata.file_type().is_socket());

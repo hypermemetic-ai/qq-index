@@ -116,11 +116,16 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
 
     while !SIGNAL_SHUTDOWN.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _address)) => {
-                if handle_client(stream, &index)? {
-                    SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst);
+            Ok((stream, _address)) => match handle_client(stream, &index) {
+                Ok(true) => SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst),
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "qq-session-indexd: dropping failed client connection: {error}"
+                    );
                 }
-            }
+            },
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL);
             }
