@@ -1,12 +1,12 @@
 # Session-history indexing: engine decision and `SearchBatchV1` contract
 
-Status: **proposed design; production engine not yet implemented**
-Proposed implementation owner: **qq-index**
+Status: **accepted design; production engine not yet implemented**
+Decision owner: **qq-index**
 Assessment snapshot: **2026-08-30**
 Turso source pin: [`tursodatabase/turso@6ab76b29a2a1e3d19866e792f2e9929aff65e08d`](https://github.com/tursodatabase/turso/tree/6ab76b29a2a1e3d19866e792f2e9929aff65e08d)
 rusqlite source pin: [`rusqlite/rusqlite@a8f0a07bf65b28c05fa54b260d39707368ad9ed3`](https://github.com/rusqlite/rusqlite/tree/a8f0a07bf65b28c05fa54b260d39707368ad9ed3)
 
-This record proposes assigning the durable session-history index to qq-index, rejects Turso
+This record assigns the durable session-history index to qq-index, rejects Turso
 Database as the first production engine, and selects a Rust service using mature
 upstream SQLite FTS5. It also fixes the versioned, policy-neutral boundary that
 qq-core can adapt to. The checked-in benchmark is a synthetic storage-shape
