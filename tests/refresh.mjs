@@ -6,7 +6,7 @@ import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { parseCliArgs, parseRepositoryRegistry, repositoriesForCli, runCli } from "../src/cli.mjs";
-import { INDEX_MAX_CHARS } from "../src/index.mjs";
+import { MAX_INJECTED_INDEX_CODE_POINTS } from "../src/index.mjs";
 import { modelPassPlan } from "../src/model-pass.mjs";
 import { refreshRepository } from "../src/refresh.mjs";
 
@@ -277,11 +277,19 @@ try {
 
   {
     const { source } = await createRepository();
-    await assert.rejects(() => refreshRepository(source, refreshOptions({
-      runModelPass: async (cloneRoot) => {
-        await put(cloneRoot, "README.md", "x".repeat(INDEX_MAX_CHARS + 1));
-      },
-    })), /exceeds 10000 Unicode code points/);
+    const longReadme = [
+      "# Valid long index",
+      "",
+      "x".repeat(MAX_INJECTED_INDEX_CODE_POINTS),
+      "",
+      "[App](src/app.mjs)",
+      "",
+    ].join("\n");
+    const result = await refreshRepository(source, refreshOptions({
+      runModelPass: async (cloneRoot) => put(cloneRoot, "README.md", longReadme),
+    }));
+    assert.equal(result.status, "published");
+    assert.equal(await readFile(resolve(source, "README.md"), "utf8"), longReadme);
   }
 
   {
@@ -391,6 +399,27 @@ try {
     assert.equal(prompt.endsWith(`${EVIDENCE.trimEnd()}\n`), true);
     assert.equal((prompt.match(/echo COMPLETE_DOCS_AND_EXIT/g) ?? []).length, 1);
     assert.doesNotMatch(prompt, /^## Traps$/m);
+
+    const priorityPhrases = [
+      "identity and purpose",
+      "established install, start, run, and test commands",
+      "selective system and component map",
+      "only critical contributor invariants",
+      "common-change to canonical-source-and-tests routing",
+      "links to authoritative detail",
+    ];
+    let priorPriority = -1;
+    for (const phrase of priorityPhrases) {
+      const position = prompt.indexOf(phrase);
+      assert.ok(position > priorPriority, `writer priority is missing or out of order: ${phrase}`);
+      priorPriority = position;
+    }
+    assert.match(prompt, /Every section must reduce uncertainty/);
+    assert.match(prompt, /Stop when a new contributor can identify the package/);
+    assert.match(prompt, /Omit lower-value material rather than/);
+    assert.match(prompt, /Exclude exhaustive file or component inventories, API manuals/);
+    assert.match(prompt, /repeated\s+lifecycle prose, chronology, long examples, generated detail/);
+    assert.doesNotMatch(prompt, /10,?000|at or below|code points/i);
 
     assert.match(plan.modelsPluginHref, /^file:\/\/.*\/qq-models\/src\/plugin\.mjs$/);
     assert.equal("miniDocs" in plan.pluginHrefs, false);

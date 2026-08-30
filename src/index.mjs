@@ -1,12 +1,37 @@
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
-export const INDEX_MAX_CHARS = 10_000;
+/** Total Unicode-code-point budget for the string returned by loadIndex. */
+export const MAX_INJECTED_INDEX_CODE_POINTS = 10_000;
+/** @deprecated Compatibility alias for MAX_INJECTED_INDEX_CODE_POINTS. */
+export const INDEX_MAX_CHARS = MAX_INJECTED_INDEX_CODE_POINTS;
+export const INDEX_TRUNCATION_MARKER =
+  "> **qq-index truncation:** This injected excerpt is incomplete. Read the full [README.md](README.md).";
+
+const READ_BUFFER_BYTES = 4 * 1024;
+const fileSystem = Object.freeze({ closeSync, openSync, readSync });
 
 function unicodeCodePointCount(text) {
   let count = 0;
   for (const _codePoint of text) count += 1;
   return count;
+}
+
+function unicodePrefix(text, maximum) {
+  const prefix = [];
+  for (const codePoint of text) {
+    if (prefix.length === maximum) break;
+    prefix.push(codePoint);
+  }
+  return prefix.join("");
 }
 
 function lstatIfPresent(path) {
@@ -28,15 +53,188 @@ function inspectIndex(repoRoot) {
   return { root, index, indexStat };
 }
 
-/** Load the bounded repository index, or an empty string when it is absent. */
+/** Read no more decoded content than is needed to distinguish limit from limit + 1. */
+function readUtf8Prefix(path, maximum, reader = fileSystem) {
+  const descriptor = reader.openSync(path, "r");
+  const decoder = new StringDecoder("utf8");
+  const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
+  const codePoints = [];
+
+  const append = (decoded) => {
+    for (const codePoint of decoded) {
+      codePoints.push(codePoint);
+      if (codePoints.length > maximum) return true;
+    }
+    return false;
+  };
+
+  try {
+    while (true) {
+      const bytesRead = reader.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) {
+        append(decoder.end());
+        return { text: codePoints.join(""), overLimit: codePoints.length > maximum };
+      }
+      if (append(decoder.write(buffer.subarray(0, bytesRead)))) {
+        return { text: codePoints.join(""), overLimit: true };
+      }
+    }
+  } finally {
+    reader.closeSync(descriptor);
+  }
+}
+
+function fenceDelimiter(line) {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (match === null) return null;
+  return { character: match[1][0], length: match[1].length };
+}
+
+function closesFence(line, fence) {
+  const match = /^ {0,3}(`{3,}|~{3,})[\t ]*$/.exec(line);
+  return match !== null && match[1][0] === fence.character && match[1].length >= fence.length;
+}
+
+function markdownBoundaries(markdown) {
+  const section = [];
+  const block = [];
+  const line = [];
+  const lines = markdown.split("\n");
+  let offset = 0;
+  let openFence = null;
+  let atxHeadingCount = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const completeLine = index < lines.length - 1;
+    const rawLine = lines[index];
+    const content = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const lineLength = unicodeCodePointCount(rawLine) + (completeLine ? 1 : 0);
+    const end = offset + lineLength;
+
+    if (openFence !== null) {
+      if (closesFence(content, openFence)) {
+        openFence = null;
+        if (completeLine) {
+          line.push(end);
+          block.push(end);
+        }
+      }
+    } else {
+      if (/^ {0,3}#{1,6}(?:[\t ]+|$)/.test(content)) {
+        atxHeadingCount += 1;
+        // A preamble can put the title at a nonzero offset. Only later ATX
+        // headings prove that a complete authored section precedes them.
+        if (atxHeadingCount > 1) section.push(offset);
+      }
+
+      const opening = fenceDelimiter(content);
+      if (opening !== null) {
+        openFence = { ...opening, start: offset };
+      } else if (completeLine) {
+        line.push(end);
+        if (/^[\t ]*$/.test(content)) block.push(end);
+      }
+    }
+    offset = end;
+  }
+
+  return { block, line, openFence, section };
+}
+
+function latestNonWhitespaceBoundary(markdown, values) {
+  if (values.length === 0) return null;
+  const boundary = values[values.length - 1];
+  return unicodePrefix(markdown, boundary).trim() === "" ? null : boundary;
+}
+
+/*
+ * A README that starts with one enormous fence has no safe authored boundary.
+ * Wrap an indented source prefix in the opposite fence style so the excerpt is
+ * still useful and the generated Markdown remains structurally closed.
+ */
+function fencedBlockFallback(source, maximum, sourceFence) {
+  const wrapperCharacter = sourceFence.character === "`" ? "~" : "`";
+  const opening = `${wrapperCharacter.repeat(3)}text\n`;
+  const closing = `\n${wrapperCharacter.repeat(3)}\n`;
+  const fixedLength = unicodeCodePointCount(opening) + unicodeCodePointCount(closing);
+  const output = [opening];
+  let used = fixedLength;
+  let atLineStart = true;
+
+  for (const codePoint of source) {
+    if (atLineStart) {
+      if (used + 4 > maximum) break;
+      output.push("    ");
+      used += 4;
+      atLineStart = false;
+    }
+    if (used + 1 > maximum) break;
+    output.push(codePoint);
+    used += 1;
+    if (codePoint === "\n") atLineStart = true;
+  }
+  output.push(closing);
+  return output.join("");
+}
+
+function appendTruncationMarker(body) {
+  const prefix = body.trimEnd();
+  if (prefix === "") return `${INDEX_TRUNCATION_MARKER}\n`;
+  return `${prefix}\n\n${INDEX_TRUNCATION_MARKER}\n`;
+}
+
+/** Project authored Markdown into the fixed total injected-output budget. */
+function projectIndex(markdown, maximum = MAX_INJECTED_INDEX_CODE_POINTS) {
+  const retained = [];
+  let overLimit = false;
+  for (const codePoint of markdown) {
+    retained.push(codePoint);
+    if (retained.length > maximum) {
+      overLimit = true;
+      break;
+    }
+  }
+  if (!overLimit) return markdown;
+
+  const markerBudget = unicodeCodePointCount(`\n\n${INDEX_TRUNCATION_MARKER}\n`);
+  const bodyBudget = maximum - markerBudget;
+  if (bodyBudget <= 0) {
+    throw new Error("qq-index: injected-output budget cannot contain its truncation marker");
+  }
+
+  const candidate = retained.slice(0, bodyBudget).join("");
+  const boundaries = markdownBoundaries(candidate);
+  // Structural priority must not let a leading blank outrank a later useful
+  // heading or line. A whitespace-only cutoff would collapse the projection
+  // to its marker and also bypass the safe fallback for an open fence.
+  const cutoff =
+    latestNonWhitespaceBoundary(candidate, boundaries.section) ??
+    latestNonWhitespaceBoundary(candidate, boundaries.block) ??
+    latestNonWhitespaceBoundary(candidate, boundaries.line);
+  let body;
+
+  if (cutoff !== null) {
+    body = unicodePrefix(candidate, cutoff);
+  } else if (boundaries.openFence !== null) {
+    body = fencedBlockFallback(candidate, bodyBudget, boundaries.openFence);
+  } else {
+    // No complete structural unit fits (for example, one enormous paragraph).
+    body = candidate;
+  }
+
+  const projected = appendTruncationMarker(body);
+  if (unicodeCodePointCount(projected) > maximum) {
+    throw new Error("qq-index: internal projection exceeded the injected-output budget");
+  }
+  return projected;
+}
+
+/** Load a bounded README projection, or an empty string when README.md is absent. */
 export function loadIndex(repoRoot) {
   const { index, indexStat } = inspectIndex(repoRoot);
   if (indexStat === null) return "";
-  const text = readFileSync(index, "utf8");
-  if (unicodeCodePointCount(text) > INDEX_MAX_CHARS) {
-    throw new Error(`qq-index: README.md exceeds ${INDEX_MAX_CHARS} Unicode code points`);
-  }
-  return text;
+  const loaded = readUtf8Prefix(index, MAX_INJECTED_INDEX_CODE_POINTS);
+  return loaded.overLimit ? projectIndex(loaded.text) : loaded.text;
 }
 
 function markdownDestinations(markdown) {
@@ -83,14 +281,16 @@ function isContained(root, candidate) {
   return rel === "" || (!isAbsolute(rel) && !rel.split(sep).includes(".."));
 }
 
-/** Validate the README bound and every local link. Returns true when valid. */
+/** Validate the complete authored README and every local link. */
 export function validateIndex(repoRoot) {
   const inspected = inspectIndex(repoRoot);
   if (inspected.indexStat === null) return true;
 
-  const index = loadIndex(repoRoot);
+  // Validation deliberately does not use loadIndex: links after its projection
+  // cutoff are still part of the authored-document contract.
+  const authoredIndex = readFileSync(inspected.index, "utf8");
   const canonicalRoot = realpathSync(inspected.root);
-  for (const destination of markdownDestinations(index)) {
+  for (const destination of markdownDestinations(authoredIndex)) {
     const local = localPathFromDestination(destination);
     if (local === null) continue;
 
@@ -110,4 +310,10 @@ export function validateIndex(repoRoot) {
   return true;
 }
 
-export const internals = Object.freeze({ markdownDestinations });
+export const internals = Object.freeze({
+  markdownBoundaries,
+  markdownDestinations,
+  projectIndex,
+  readUtf8Prefix,
+  unicodeCodePointCount,
+});
