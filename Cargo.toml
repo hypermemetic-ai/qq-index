@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/session-index-core"]
+members = ["crates/session-index-core", "crates/session-indexd"]
 
 [workspace.package]
 edition = "2024"
@@ -8,5 +8,8 @@ license = "MIT"
 rust-version = "1.88"
 
 [workspace.dependencies]
+libc = "=0.2.182"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled"] }
 thiserror = "=2.0.18"
