@@ -1,69 +1,32 @@
 # qq-index
 
-`@hypermemetic-ai/qq-index` keeps repository orientation at the conventional
-entry point: root `README.md`. The authored README is a compact editorial
-product for GitHub, npm, and contributors. `loadIndex` returns it unchanged when
-it fits the injection budget and otherwise returns a deterministic Markdown
-excerpt with a truncation marker and a route back to the full document.
+`@hypermemetic-ai/qq-index` is a private ESM package for **bounded repository orientation in `README.md`**. Its package-level main entry point and only export are [`src/plugin.mjs`](src/plugin.mjs); it also declares the `qq-index-refresh` executable at [`bin/qq-index-refresh`](bin/qq-index-refresh). See [`package.json`](package.json) for the authoritative package surface.
 
-## Run and test
+## Commands
 
-```bash
+The repository declares one automated task:
+
+```sh
 npm test
-bin/qq-index-refresh --repo /path/to/repository
 ```
 
-Without `--repo`, the refresh CLI reads [`config/repositories`](config/repositories)
-and processes that bounded registry at concurrency three. The packaged oneshot
-and schedule are [`systemd/user/qq-index.service`](systemd/user/qq-index.service)
-and [`systemd/user/qq-index.timer`](systemd/user/qq-index.timer); the service
-expects this checkout at `%h/projects/qq-index`.
+It runs the plugin, index, harvest, writer-boot, and refresh test scripts in that order. No install or start script is declared. The package metadata establishes the `qq-index-refresh` executable name, but not an installation procedure, arguments, or usage contract.
 
-## System map
+## Repository map
 
-- [`src/plugin.mjs`](src/plugin.mjs) is the Cordis entry point and provides the
-  frozen `qq-index` service.
-- [`src/index.mjs`](src/index.mjs) owns full-document link validation and the
-  separate bounded `loadIndex` projection.
-- [`src/harvest.mjs`](src/harvest.mjs) builds deterministic writer evidence from
-  package metadata, tracked paths, change heat, and relative-import fan-in.
-- [`prompts/writer.md`](prompts/writer.md),
-  [`src/model-pass.mjs`](src/model-pass.mjs), and
-  [`src/writer-boot.mjs`](src/writer-boot.mjs) define and launch the constrained
-  headless README writer.
-- [`src/refresh.mjs`](src/refresh.mjs) isolates, validates, commits, and
-  fast-forwards an accepted README-only result; [`src/cli.mjs`](src/cli.mjs)
-  selects repositories and bounds parallel refreshes.
+- **Package boundary:** [`src/plugin.mjs`](src/plugin.mjs) is the exported module; [`bin/qq-index-refresh`](bin/qq-index-refresh) is the declared executable.
+- **Central source modules:** [`src/harvest.mjs`](src/harvest.mjs) has the highest relative-module fan-in in the repository; [`src/index.mjs`](src/index.mjs), [`src/model-pass.mjs`](src/model-pass.mjs), and [`src/refresh.mjs`](src/refresh.mjs) are the next most imported. Use this as a review-priority signal, not as evidence of undocumented runtime behavior.
+- **Writer and repository inputs:** writer-named assets live in [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml), and [`src/writer-boot.mjs`](src/writer-boot.mjs); repository configuration is tracked in [`config/repositories`](config/repositories).
+- **User service files:** the tracked unit and schedule are [`systemd/user/qq-index.service`](systemd/user/qq-index.service) and [`systemd/user/qq-index.timer`](systemd/user/qq-index.timer).
 
-## Contributor invariants
+## Route a change
 
-- The complete authored README is valid independently of injection size. Every
-  local link and image must resolve to a regular file inside the repository;
-  external URLs and in-document fragments are ignored.
-- Injected output has a total 10,000-Unicode-code-point failsafe, including its
-  marker and full-README route. Oversize readable content degrades to a useful
-  excerpt; size alone is not a validation error.
-- The writer treats the evidence packet as its only repository evidence and may
-  replace only `README.md`. Package metadata can establish commands; path heat
-  and fan-in can support routing, but path names do not prove behavior.
-- Refresh runs under a per-repository lock in an isolated clean `main` clone,
-  rejects non-README changes, validates before commit, and publishes only when
-  live `main` can still fast-forward from the captured revision.
+| Change area | Start with | Focused test |
+| --- | --- | --- |
+| Package export or plugin | [`package.json`](package.json), [`src/plugin.mjs`](src/plugin.mjs) | [`tests/plugin.mjs`](tests/plugin.mjs) |
+| Index-named module | [`src/index.mjs`](src/index.mjs) | [`tests/index.mjs`](tests/index.mjs) |
+| Harvest-named module | [`src/harvest.mjs`](src/harvest.mjs) | [`tests/harvest.mjs`](tests/harvest.mjs) |
+| Writer bootstrap | [`src/writer-boot.mjs`](src/writer-boot.mjs) | [`tests/writer-boot.mjs`](tests/writer-boot.mjs) |
+| Refresh-named module | [`src/refresh.mjs`](src/refresh.mjs) | [`tests/refresh.mjs`](tests/refresh.mjs) |
 
-## Change routing
-
-- Injection budget, Markdown projection, or link policy:
-  [`src/index.mjs`](src/index.mjs) and [`tests/index.mjs`](tests/index.mjs).
-- Evidence shape, path ranking, or import resolution:
-  [`src/harvest.mjs`](src/harvest.mjs) and
-  [`tests/harvest.mjs`](tests/harvest.mjs).
-- Writer contract or model launch: [`prompts/writer.md`](prompts/writer.md),
-  [`src/model-pass.mjs`](src/model-pass.mjs), and
-  [`tests/refresh.mjs`](tests/refresh.mjs).
-- Mini Docs mounting: [`src/writer-boot.mjs`](src/writer-boot.mjs) and
-  [`tests/writer-boot.mjs`](tests/writer-boot.mjs).
-- Locking, Git boundaries, validation timing, or publication:
-  [`src/refresh.mjs`](src/refresh.mjs) and
-  [`tests/refresh.mjs`](tests/refresh.mjs).
-- Registry parsing or bounded concurrency: [`src/cli.mjs`](src/cli.mjs) with CLI
-  coverage in [`tests/refresh.mjs`](tests/refresh.mjs).
+Run `npm test` after a focused check. The tracked paths do not establish direct test coverage for prompt, configuration, model-pass, executable, or systemd-file changes, so use the full declared suite and review the affected boundary explicitly.
