@@ -4,18 +4,21 @@ import { isAbsolute } from "node:path";
 export const SESSION_INDEX_PROTOCOL_VERSION = "qq-session-index-protocol-v1";
 export const SESSION_INDEX_MUTATION_VERSION = "mutation-batch-v1";
 export const SESSION_INDEX_SEARCH_VERSION = "search-batch-v1";
+export const SESSION_INDEX_SOURCE_STATE_VERSION = "source-state-v1";
 export const SESSION_INDEX_MAX_FRAME_BYTES = 1024 * 1024;
 
 const HEALTH_RESPONSE_VERSION = "health-response-v1";
 const COMMIT_RECEIPT_VERSION = "commit-receipt-v1";
 const SEARCH_RESPONSE_VERSION = "search-batch-response-v1";
 const SHUTDOWN_RESPONSE_VERSION = "shutdown-response-v1";
+const SOURCE_STATE_RESPONSE_VERSION = "source-state-response-v1";
 const SCHEMA_FINGERPRINT = "qq-session-index-schema-v1";
 const PROJECTION_VERSION = "qq-session-projection-v1";
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_TIMEOUT_MS = 600_000;
 const MAX_REQUEST_ID_BYTES = 128;
 const MAX_DOCUMENTS = 1_024;
+const MAX_SOURCE_STATE_SESSIONS = 32;
 const MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807n;
 const MAX_U64 = 18_446_744_073_709_551_615n;
 const TERMINAL_ERROR_CODES = new Set([
@@ -99,6 +102,22 @@ class SessionIndexClient {
 
   health(options = {}) {
     return this.#enqueue({ type: "health" }, validateHealthResponse, options);
+  }
+
+  sourceState(request, options = {}) {
+    exactObject(request, ["sessionIds"], [], "sourceState request");
+    stringList(request.sessionIds, "sourceState sessionIds", MAX_SOURCE_STATE_SESSIONS, 128);
+    const wireRequest = structuredClone(request);
+    stringList(wireRequest.sessionIds, "sourceState sessionIds", MAX_SOURCE_STATE_SESSIONS, 128);
+    return this.#enqueue(
+      {
+        type: "sourceState",
+        version: SESSION_INDEX_SOURCE_STATE_VERSION,
+        sessionIds: wireRequest.sessionIds,
+      },
+      (response) => validateSourceStateResponse(response, wireRequest.sessionIds),
+      options,
+    );
   }
 
   applyBatch(batch, options = {}) {
@@ -406,9 +425,43 @@ function validateDocument(document, name) {
   boundedString(document.surface, `${name}.surface`, 1, 64);
   boundedString(document.workspaceId, `${name}.workspaceId`, 1, 4_096);
   scopeTokens(document.scopeTokens, `${name}.scopeTokens`);
-  boundedString(document.body, `${name}.body`, 1, 1_048_576);
+  boundedString(document.body, `${name}.body`, 0, 1_048_576);
   boundedString(document.fingerprint, `${name}.fingerprint`, 1, 256);
   boundedString(document.sourceRevision, `${name}.sourceRevision`, 1, 256);
+}
+
+function validateSourceStateResponse(response, requestedSessionIds) {
+  exactObject(response, [
+    "type",
+    "version",
+    "generation",
+    "sourceWatermark",
+    "sessions",
+  ], [], "sourceState response");
+  equal(response.type, "sourceState", "sourceState response type");
+  equal(response.version, SOURCE_STATE_RESPONSE_VERSION, "sourceState response version");
+  unsignedString(response.generation, "sourceState generation", MAX_SQLITE_INTEGER);
+  unsignedString(response.sourceWatermark, "sourceState sourceWatermark", MAX_SQLITE_INTEGER);
+  boundedArray(response.sessions, "sourceState sessions", 0, requestedSessionIds.length);
+  const requested = new Set(requestedSessionIds);
+  const received = new Set();
+  for (const [index, session] of response.sessions.entries()) {
+    const name = `sourceState sessions[${index}]`;
+    exactObject(session, [
+      "sessionId",
+      "nextSeq",
+      "workspaceId",
+      "headerRevision",
+    ], [], name);
+    boundedString(session.sessionId, `${name}.sessionId`, 1, 128);
+    if (!requested.has(session.sessionId) || received.has(session.sessionId)) {
+      invalid(`${name}.sessionId was not uniquely requested`, "protocol_violation");
+    }
+    received.add(session.sessionId);
+    unsignedString(session.nextSeq, `${name}.nextSeq`, MAX_SQLITE_INTEGER);
+    boundedString(session.workspaceId, `${name}.workspaceId`, 1, 4_096);
+    boundedString(session.headerRevision, `${name}.headerRevision`, 1, 256);
+  }
 }
 
 function validateCommitReceipt(response) {
@@ -461,6 +514,7 @@ function validateFilters(filters) {
     "authorizedScopeTokens",
     "workspaceIds",
     "surfaceAllowList",
+    "eventTypeAllowList",
   ], [
     "includeSessionIds",
     "excludeSessionIds",
@@ -471,6 +525,7 @@ function validateFilters(filters) {
   scopeTokens(filters.authorizedScopeTokens, "filters.authorizedScopeTokens");
   stringList(filters.workspaceIds, "filters.workspaceIds", 32, 4_096);
   stringList(filters.surfaceAllowList, "filters.surfaceAllowList", 32, 64);
+  stringList(filters.eventTypeAllowList, "filters.eventTypeAllowList", 32, 96);
   if (filters.includeSessionIds !== undefined) {
     stringList(filters.includeSessionIds, "filters.includeSessionIds", 128, 128);
   }

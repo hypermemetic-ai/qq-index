@@ -7,7 +7,8 @@
   "main": "src/plugin.mjs",
   "exports": {
     ".": "./src/plugin.mjs",
-    "./session-index-client": "./src/session-index-client.mjs"
+    "./session-index-client": "./src/session-index-client.mjs",
+    "./session-index-dsh-source": "./src/session-index-dsh-source.mjs"
   },
   "files": [
     "bin/",
@@ -20,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-e2e",
+    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-dsh-e2e && npm run test:session-index-e2e",
     "benchmark:session-history": "python3 benchmarks/session_history_fts5.py",
     "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled",
     "rust:fmt": "cargo fmt --check",
@@ -28,7 +29,8 @@
     "rust:test": "cargo test --workspace",
     "daemon:build": "cargo build --package qq-session-indexd --bin qq-session-indexd",
     "daemon:test": "cargo test --package qq-session-indexd",
-    "test:session-index-e2e": "node tests/session-index-client.e2e.mjs"
+    "test:session-index-e2e": "node tests/session-index-client.e2e.mjs",
+    "test:session-index-dsh-e2e": "node tests/session-index-dsh-source.e2e.mjs"
   },
   "bin": {
     "qq-index-refresh": "bin/qq-index-refresh",

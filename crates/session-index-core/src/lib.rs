@@ -30,7 +30,9 @@ pub const SCHEMA_FINGERPRINT: &str = "qq-session-index-schema-v1";
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const MAX_SESSION_ID_BYTES: usize = 128;
 pub(crate) const MAX_WORKSPACE_BYTES: usize = 4_096;
-const MAX_EVENT_TYPE_BYTES: usize = 96;
+pub(crate) const MAX_EVENT_TYPE_BYTES: usize = 96;
+/// Maximum session states returned by one read-only source-state call.
+pub const MAX_SOURCE_STATE_SESSIONS_V1: usize = 32;
 pub(crate) const MAX_SURFACE_BYTES: usize = 64;
 const MAX_BODY_BYTES: usize = 1_048_576;
 const MAX_FINGERPRINT_BYTES: usize = 256;
@@ -291,6 +293,23 @@ pub struct IndexMetadata {
     pub projection_version: String,
 }
 
+/// Durable cursor for one projected source session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceSessionStateV1 {
+    pub session_id: String,
+    pub next_seq: u64,
+    pub workspace_id: String,
+    pub header_revision: String,
+}
+
+/// Read-only, policy-neutral source progress snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceStateV1 {
+    pub generation: u64,
+    pub source_watermark: u64,
+    pub sessions: Vec<SourceSessionStateV1>,
+}
+
 /// Single-connection Phase 1A storage core.
 ///
 /// The mutex serializes current operations. A later service milestone will add a
@@ -367,6 +386,61 @@ impl SessionIndex {
             .lock()?
             .query_row("SELECT count(*) FROM documents", [], |row| row.get(0))?;
         i64_to_u64(count, "document count")
+    }
+
+    /// Read durable cursors for a bounded set of source session IDs.
+    ///
+    /// Missing IDs are omitted. This performs no source discovery or reconciliation.
+    pub fn source_state_v1(&self, session_ids: &[String]) -> Result<SourceStateV1, IndexError> {
+        if session_ids.len() > MAX_SOURCE_STATE_SESSIONS_V1 {
+            return Err(IndexError::InvalidMutation(format!(
+                "source-state session count must be 0..={MAX_SOURCE_STATE_SESSIONS_V1}"
+            )));
+        }
+        let mut unique = BTreeSet::new();
+        for session_id in session_ids {
+            validate_text(
+                "source-state session id",
+                session_id,
+                1,
+                MAX_SESSION_ID_BYTES,
+            )?;
+            if !unique.insert(session_id) {
+                return Err(IndexError::InvalidMutation(
+                    "source-state session IDs must not contain duplicates".to_owned(),
+                ));
+            }
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let metadata = read_metadata_tx(&transaction)?;
+        let mut sessions = Vec::with_capacity(session_ids.len());
+        let mut statement = transaction.prepare_cached(
+            "SELECT next_seq, workspace_id, header_revision FROM sessions WHERE session_id = ?1",
+        )?;
+        for session_id in session_ids {
+            let stored: Option<(i64, String, String)> = statement
+                .query_row([session_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .optional()?;
+            if let Some((next_seq, workspace_id, header_revision)) = stored {
+                sessions.push(SourceSessionStateV1 {
+                    session_id: session_id.clone(),
+                    next_seq: i64_to_u64(next_seq, "session next_seq")?,
+                    workspace_id,
+                    header_revision,
+                });
+            }
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(SourceStateV1 {
+            generation: metadata.generation,
+            source_watermark: metadata.source_watermark,
+            sessions,
+        })
     }
 
     /// Apply a normalized incremental batch in one atomic transaction.
@@ -838,7 +912,7 @@ fn validate_document(document: &ProjectedDocument) -> Result<(), IndexError> {
         1,
         MAX_WORKSPACE_BYTES,
     )?;
-    validate_text("body", &document.body, 1, MAX_BODY_BYTES)?;
+    validate_text("body", &document.body, 0, MAX_BODY_BYTES)?;
     validate_text(
         "document fingerprint",
         &document.fingerprint,
@@ -1060,6 +1134,41 @@ mod tests {
         assert_eq!(reopened.metadata().unwrap().generation, 2);
         assert_eq!(reopened.metadata().unwrap().source_watermark, 11);
         assert_eq!(reopened.document_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn reads_bounded_durable_source_state_without_reconciliation() {
+        let (_root, _path, index) = index();
+        let mut structural = document("session-a", 0, "", &["scopea"]);
+        structural.source_revision = "header-revision-zero".to_owned();
+        index
+            .apply_batch(&batch("source-state", 4, vec![structural]))
+            .unwrap();
+
+        let state = index
+            .source_state_v1(&["missing".to_owned(), "session-a".to_owned()])
+            .unwrap();
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.source_watermark, 4);
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].session_id, "session-a");
+        assert_eq!(state.sessions[0].next_seq, 1);
+        assert_eq!(state.sessions[0].workspace_id, "workspace-a");
+        assert_eq!(state.sessions[0].header_revision, "header-revision-zero");
+        assert!(
+            index
+                .source_state_v1(&["duplicate".to_owned(), "duplicate".to_owned()])
+                .is_err()
+        );
+        assert!(
+            index
+                .source_state_v1(
+                    &(0..=MAX_SOURCE_STATE_SESSIONS_V1)
+                        .map(|value| format!("bounded-{value}"))
+                        .collect::<Vec<_>>(),
+                )
+                .is_err()
+        );
     }
 
     #[test]

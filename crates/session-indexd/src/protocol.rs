@@ -2,7 +2,7 @@ use qq_session_index_core::{
     CommitReceipt, FusedSessionV1, IndexError, IndexMetadata, MutationBatch, ProjectedDocument,
     RrfContributionV1, SCHEMA_FINGERPRINT, SCHEMA_VERSION, SEARCH_BATCH_RESPONSE_VERSION_V1,
     SEARCH_BATCH_VERSION_V1, SearchBatchResponseV1, SearchBatchV1, SearchFiltersV1, SearchSourceV1,
-    SessionSeqBoundV1, SourceTruncationReasonV1, VerificationPointerV1,
+    SessionSeqBoundV1, SourceStateV1, SourceTruncationReasonV1, VerificationPointerV1,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,6 +13,8 @@ pub const MUTATION_BATCH_VERSION: &str = "mutation-batch-v1";
 pub const COMMIT_RECEIPT_VERSION: &str = "commit-receipt-v1";
 pub const HEALTH_RESPONSE_VERSION: &str = "health-response-v1";
 pub const SHUTDOWN_RESPONSE_VERSION: &str = "shutdown-response-v1";
+pub const SOURCE_STATE_VERSION_V1: &str = "source-state-v1";
+pub const SOURCE_STATE_RESPONSE_VERSION_V1: &str = "source-state-response-v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_WIRE_DOCUMENTS: usize = 1024;
@@ -36,6 +38,10 @@ pub(crate) struct RequestEnvelope {
 )]
 pub(crate) enum WireOperation {
     Health,
+    SourceState {
+        version: String,
+        session_ids: Vec<String>,
+    },
     ApplyBatch {
         version: String,
         batch: WireMutationBatch,
@@ -82,6 +88,7 @@ pub(crate) struct WireSearchFilters {
     authorized_scope_tokens: Vec<String>,
     workspace_ids: Vec<String>,
     surface_allow_list: Vec<String>,
+    event_type_allow_list: Vec<String>,
     #[serde(default)]
     include_session_ids: Vec<String>,
     #[serde(default)]
@@ -173,6 +180,7 @@ fn validate_operation_keys(frame: &[u8], operation: &WireOperation) -> Result<()
         .ok_or_else(|| ProtocolError::Malformed("operation must be an object".to_owned()))?;
     let allowed: &[&str] = match operation {
         WireOperation::Health | WireOperation::Shutdown => &["type"],
+        WireOperation::SourceState { .. } => &["type", "version", "sessionIds"],
         WireOperation::ApplyBatch { .. } => &["type", "version", "batch"],
         WireOperation::SearchBatch { .. } => &[
             "type",
@@ -297,6 +305,7 @@ pub(crate) fn into_core_search(
             authorized_scope_terms: filters.authorized_scope_tokens,
             workspace_ids: filters.workspace_ids,
             surface_allow_list: filters.surface_allow_list,
+            event_type_allow_list: filters.event_type_allow_list,
             include_session_ids: filters.include_session_ids,
             exclude_session_ids: filters.exclude_session_ids,
             not_before_event_time_unix_ms: filters.not_before_event_time_unix_ms,
@@ -371,6 +380,21 @@ pub(crate) fn health_response(metadata: &IndexMetadata) -> Value {
             "activeSqliteInterrupt": false,
             "maxFrameBytes": MAX_FRAME_BYTES,
         },
+    })
+}
+
+pub(crate) fn source_state_response(state: &SourceStateV1) -> Value {
+    json!({
+        "type": "sourceState",
+        "version": SOURCE_STATE_RESPONSE_VERSION_V1,
+        "generation": state.generation.to_string(),
+        "sourceWatermark": state.source_watermark.to_string(),
+        "sessions": state.sessions.iter().map(|session| json!({
+            "sessionId": session.session_id,
+            "nextSeq": session.next_seq.to_string(),
+            "workspaceId": session.workspace_id,
+            "headerRevision": session.header_revision,
+        })).collect::<Vec<_>>(),
     })
 }
 

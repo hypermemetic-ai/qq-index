@@ -444,6 +444,7 @@ fn workspace_surface_session_time_and_sequence_filters_are_applied() {
     let mut a1 = projected("session-a", 1, "nebula shared", &["scopea"]);
     a1.event_time_unix_ms = 200;
     a1.surface = "tool".to_owned();
+    a1.event_type = "tool/result".to_owned();
     let mut a2 = projected("session-a", 2, "nebula shared", &["scopea"]);
     a2.event_time_unix_ms = 300;
     let mut b0 = projected("session-b", 0, "nebula shared", &["scopea"]);
@@ -463,6 +464,30 @@ fn workspace_surface_session_time_and_sequence_filters_are_applied() {
     assert_eq!(surface_result.sources[0].ranked.len(), 1);
     assert_eq!(surface_result.sources[0].ranked[0].evidence.seq, 1);
     assert_eq!(surface_result.sources[0].ranked[0].evidence.surface, "tool");
+
+    let mut tool_type = workspace.clone();
+    tool_type.filters.event_type_allow_list = vec!["tool/result".to_owned()];
+    let tool_type_result = index
+        .search_batch_v1(&tool_type)
+        .expect("event-type filter");
+    assert_eq!(tool_type_result.sources[0].ranked.len(), 1);
+    assert_eq!(tool_type_result.sources[0].ranked[0].evidence.seq, 1);
+    assert_eq!(
+        tool_type_result.sources[0].ranked[0].evidence.event_type,
+        "tool/result"
+    );
+
+    let mut conversation_type = workspace.clone();
+    conversation_type.filters.event_type_allow_list = vec!["message/generated".to_owned()];
+    let conversation_result = index
+        .search_batch_v1(&conversation_type)
+        .expect("conversation type filter");
+    assert!(
+        conversation_result.sources[0]
+            .ranked
+            .iter()
+            .all(|hit| hit.evidence.event_type == "message/generated")
+    );
 
     let mut as_of = workspace.clone();
     as_of.filters.not_after_event_time_unix_ms = Some(150);
@@ -673,6 +698,13 @@ fn request_cardinality_lengths_and_ranges_are_strict() {
             filters: SearchFiltersV1 {
                 not_before_event_time_unix_ms: Some(2),
                 not_after_event_time_unix_ms: Some(1),
+                ..filters(&["scopea"])
+            },
+            ..request(&["valid"], &["scopea"])
+        },
+        SearchBatchV1 {
+            filters: SearchFiltersV1 {
+                event_type_allow_list: (0..=32).map(|value| format!("type/{value}")).collect(),
                 ..filters(&["scopea"])
             },
             ..request(&["valid"], &["scopea"])

@@ -1,6 +1,6 @@
 # Session-history indexing: engine decision and `SearchBatchV1` contract
 
-Status: **accepted design; Phase 1A core and Phase 1B.1 serialized UDS daemon/Node client implemented with generated E2E coverage; pooled production service not yet implemented**
+Status: **accepted design; Phase 1A core, Phase 1B.1 transport, and Phase 1B.2a qq-index-owned generated/fake DSH adapter implemented; pooled production service not yet implemented**
 Decision owner: **qq-index**
 Assessment snapshot: **2026-08-30**
 Turso source pin: [`tursodatabase/turso@6ab76b29a2a1e3d19866e792f2e9929aff65e08d`](https://github.com/tursodatabase/turso/tree/6ab76b29a2a1e3d19866e792f2e9929aff65e08d)
@@ -16,16 +16,18 @@ microbenchmark, not that service and not a production SLO qualification.
 
 Phase 1A is implemented in the `qq-session-index-core` Rust library. Phase 1B.1
 adds `qq-session-indexd` and the exported Node client
-`@hypermemetic-ai/qq-index/session-index-client`. The daemon owns all SQLite,
-FTS5, snapshot, and RRF work and exposes only a local Unix-domain socket. It
-requires absolute `--socket` and `--database` paths plus exactly one of
-`--create` or `--open`; opening validates the existing index and does not
-enumerate or reconcile source data.
+`@hypermemetic-ai/qq-index/session-index-client`. Phase 1B.2a adds the exported
+`@hypermemetic-ai/qq-index/session-index-dsh-source` projection/feed and exact
+verification helpers. The daemon owns all SQLite, FTS5, snapshot, and RRF work
+and exposes only a local Unix-domain socket. It requires absolute `--socket` and
+`--database` paths plus exactly one of `--create` or `--open`; opening validates
+the existing index and does not enumerate or reconcile source data.
 
 The landed newline-JSON protocol is `qq-session-index-protocol-v1`, capped at
 1 MiB per frame. Every request has a bounded ASCII request ID and absolute
-`deadlineUnixMs`. Operations are `health`, `applyBatch` (`mutation-batch-v1`),
-`searchBatch` (`search-batch-v1`), and same-UID `shutdown`. Unsigned 64-bit wire
+`deadlineUnixMs`. Operations are `health`, `sourceState` (`source-state-v1`),
+`applyBatch` (`mutation-batch-v1`), `searchBatch` (`search-batch-v1`), and
+same-UID `shutdown`. Unsigned 64-bit wire
 coordinates are canonical decimal strings so Node never loses precision. Health
 reports schema/projection/search versions, generation/watermark, and these exact
 capabilities: local UDS, serialized requests, a 1 MiB frame maximum, and
@@ -33,14 +35,16 @@ capabilities: local UDS, serialized requests, a 1 MiB frame maximum, and
 is mode `0600`, pre-existing targets are refused, and shutdown removes only the
 same daemon-owned socket inode.
 
-This slice is deliberately one serialized core connection. Deadlines are checked
-before and after core work; the Node client counts queue/socket wait and supports
-AbortSignal, but disconnecting does not interrupt active SQLite. Remaining work
-is explicit: a bounded reader pool, cross-thread `sqlite3_interrupt`/progress
-cancellation, bounded admission and connection retirement, a DSH projection
-adapter, fenced resumable backfill, live feed and durable checkpoints, production
-metrics, qq-core's thin grant/policy/as-of/client/formatting adapter, and shadow
-cutover. None runs implicitly during open or search. The landed surface remains
+This slice retains one serialized core connection, but accepts up to 32 client
+connections concurrently so a long-lived ingest client and independent search
+clients coexist. Deadlines are checked before and after core work; the Node
+client counts queue/socket wait and supports AbortSignal, but disconnecting does
+not interrupt active SQLite. Remaining work is explicit: a reader pool,
+cross-thread `sqlite3_interrupt`/progress cancellation and connection retirement,
+a durable administrative pause/job table, deletion and targeted surface repair,
+production metrics/shadow rollout, and qq-core's thin
+grant/policy/as-of/client/formatting mount and cutover. None runs implicitly
+during open or search. The landed surface remains
 valid only while formatting, strict Clippy, workspace tests, the generated Node
 E2E, and full `npm test` pass.
 
@@ -56,23 +60,26 @@ path option. Tests enforce that boundary.
 
 Responsibilities remain split as follows:
 
-- **qq-index:** durable index schema and lifecycle; incremental ingestion;
-  explicit resumable backfill; pooled retrieval; 1–5-literal batch search;
+- **qq-index:** DSH projection/source integration, source cursors, fenced resumable
+  bootstrap/live feed and exact verification helpers; durable index schema and
+  lifecycle; incremental ingestion; pooled retrieval; 1–5-literal batch search;
   deterministic fusion primitives; snapshot, isolation, cancellation and
   deadline behavior; service metrics; stable capability/version handshake; and
   storage-level performance gates.
 - **qq-core:** gesture/grant checks; workspace, conversation-only, session and
   as-of policy; conversion of those decisions to authorized primitive filters;
-  schema consumed by the model; result formatting; and final verification
-  against exact visible conversation text.
+  one client invocation, schema consumed by the model, result formatting, and
+  final allow/deny. qq-core calls qq-index's exact verification helper rather
+  than owning source projection or reconciliation.
 - **qq-workflows:** architecture and delegation tools only.
 
 qq-index must never infer authorization policy. Its service accepts already
 normalized literals, primitive authorized bounds, and opaque authorized scope
-tokens derived by qq-core. qq-index indexes those tokens and intersects them
-inside retrieval but does not interpret their policy meaning. A candidate or
-snippet is still untrusted input to qq-core's final exact-visible-text
-verification.
+tokens computed through qq-index's exported derivation only after qq-core has
+authorized a workspace. qq-index indexes those tokens and intersects them inside
+retrieval but does not interpret their policy meaning. A candidate remains
+untrusted input to qq-core's final allow/deny after qq-index's exact-source
+verification helper runs against caller-supplied authorized types and surfaces.
 
 ## Incident mechanics and bounded conclusion
 
@@ -309,6 +316,30 @@ candidate depths, and list cardinalities have protocol limits even where
 abbreviated below. The Node client creates and validates the envelope, so its `searchBatch`
 method accepts only the `SearchBatchV1` operation body.
 
+The read-only cursor operation performs no source reconciliation. Requests name
+at most 32 distinct sessions; missing sessions are omitted, and all returned
+rows share the same core snapshot:
+
+```ts
+type SourceStateV1 = {
+  type: "sourceState"; // inserted by the Node client
+  version: "source-state-v1";
+  sessionIds: string[];
+};
+type SourceStateResponseV1 = {
+  type: "sourceState";
+  version: "source-state-response-v1";
+  generation: string;
+  sourceWatermark: string;
+  sessions: Array<{
+    sessionId: string;
+    nextSeq: string;
+    workspaceId: string;
+    headerRevision: string;
+  }>;
+};
+```
+
 ```ts
 type SearchBatchV1 = {
   type: "searchBatch";         // inserted by the Node client
@@ -318,11 +349,12 @@ type SearchBatchV1 = {
   perSourceDepth: number;
   finalLimit: number;
   filters: {
-    // Nonempty, bounded, opaque tokens derived by qq-core and also attached to
-    // documents at ingest. Retrieval intersects them inside FTS MATCH.
+    // Nonempty, bounded opaque tokens computed by qq-index's exported derivation
+    // for workspaces already authorized by qq-core and attached at ingest.
     authorizedScopeTokens: string[];
     workspaceIds: string[];
     surfaceAllowList: string[];
+    eventTypeAllowList: string[]; // bounded SQL metadata predicate
     includeSessionIds?: string[];
     excludeSessionIds?: string[];
     notBeforeEventTimeUnixMs?: number;
@@ -406,9 +438,11 @@ target but still missed the five-literal p50 target, so it is necessary rather
 than sufficient; fixed work bounds and the production streaming query remain
 gates. Each projected document therefore carries one or
 more opaque scope tokens in a dedicated indexed FTS field. The trusted ingest
-adapter obtains those tokens from qq-core's versioned derivation (for example,
-an authorized workspace/surface partition); `SearchBatchV1` supplies the
-currently authorized tokens. The FTS expression is the conjunction of the
+adapter and thin caller obtain those tokens from qq-index's exported
+`deriveWorkspaceScopeToken(workspaceId)`, which returns `w` plus 63 lowercase
+hex characters from a domain-separated SHA-256 digest. qq-core calls it only for
+an already-authorized workspace; the token encodes no grant. `SearchBatchV1`
+supplies the currently authorized tokens. The FTS expression is the conjunction of the
 literal field and the OR of those tokens. SQL metadata predicates remain as
 defense-in-depth, not the primary way to reduce postings. Tokens have a strict
 alphabet/version/cardinality bound, are never logged or emitted as metrics, and
@@ -493,9 +527,73 @@ watermark. The adapter acknowledges ingestion only after that commit. Event
 fingerprints protect idempotency; they are not obtained by repeatedly hashing
 all live sessions.
 
-## Explicit resumable backfill
+## Landed Phase 1B.2a DSH adapter
 
-Backfill has a durable job record and an administrative API/CLI:
+`@hypermemetic-ai/qq-index/session-index-dsh-source` exports:
+
+```js
+const source = createDshSessionIndexSource({
+  sessionQuery,             // listSessions(signal), readSession(sessionId)
+  subscribe,                // listener for global session/* notifications
+  clientFactory,            // returns a session-index client
+  projectionHelpers: {
+    buildSessionEventRecords,
+    buildSessionEventSearchDocuments,
+    extractSessionEventText,
+  },
+});
+await source.start();        // fenced corpus scan, catch-up, then live
+await source.sync();         // explicit later corpus rescan
+source.status();             // bounded phase/count/watermark/error class only
+await source.pause();        // in-process lifecycle pause
+await source.close();
+```
+
+When helpers are not injected, the module dynamically imports the public
+`@deepseek-ai/dsh-session-query` mechanical helpers. Tests inject generated
+implementations and never open a real DSH path. Projection validates the complete
+raw record log as ordered and contiguous from sequence zero. It emits one index
+row for every raw sequence: semantic search documents supply extracted body
+text, while structural/omitted records get an empty, non-matching body. Event
+type, time, surface, workspace and raw sequence are retained. Domain-separated
+SHA-256 fingerprints and source revisions cover the canonical generated fields.
+No grant is projected.
+
+`start()` installs the live subscription before `listSessions(signal)`. It reads
+bounded daemon `sourceState` snapshots, fully validates every listed current log,
+and sends only each durable `nextSeq` suffix. Batches obey daemon document/payload
+limits and have deterministic payload fingerprints/idempotency keys; every
+successful commit advances the global source watermark monotonically. IDs
+observed while listing/reading are buffered, then reread and resumed from fresh
+durable cursors. After catch-up, notifications feed one bounded serialized queue.
+A normal live notification rereads the log for validation but submits only its
+uncommitted suffix, never a whole-session reinsert. Crash/restart performs the
+same full validation and starts from daemon cursors rather than sequence zero.
+
+`status()` contains phase, sessions scanned, raw events committed, projected
+rows/documents committed, buffered-session count, watermark and a bounded
+error name/code. It contains no query text or session IDs. This lifecycle state
+and live buffer are intentionally in memory; the durable restart authority is
+the daemon's per-session cursor and source watermark.
+
+`verifyDshSearchCandidates` accepts an already-authorized search response,
+literals, explicit event-type/surface allow lists, and `readEvent`/text extraction.
+It deduplicates `(sessionId, seq)`, bounds exact-read concurrency/cardinality,
+requires literal presence and pointer/source type/surface agreement, and returns
+only verified candidates/evidence. Missing or stale source events fail closed.
+The helper does not authorize a workspace, session, type, or surface.
+
+This first bridge is append-only. Source replacement can leave earlier
+current/shadowed conversation labels stale, which is acceptable only while
+`/find-session` allows both labels. Targeted surface repair is scheduled and
+must land before policy
+distinguishes them. `session/disposed` is recorded for a later corpus sync and
+never blindly deletes a durable row because persistence may still own it; any
+stale hit must fail exact verification.
+
+## Target durable administrative backfill
+
+A later backfill coordinator has a durable job record and administrative API/CLI:
 
 ```text
 start -> running -> catching-up -> complete
@@ -507,7 +605,8 @@ start -> running -> catching-up -> complete
           failed --resume--> running
 ```
 
-`start` records schema/projection versions and a source fence. `running` scans
+The future administrative `start` records schema/projection versions and a source
+fence. `running` scans
 bounded source batches in stable source-key order and commits a checkpoint after
 each idempotent batch. `pause` stops after a commit. `resume` validates versions
 and continues from the checkpoint, never from zero. Events newer than the fence
@@ -610,7 +709,7 @@ gates described here.
 The 250,000-document SQLite observation leaves substantial storage-query
 headroom relative to the target, but it is not an end-to-end forecast. IPC,
 queueing, snippets, projection/ranking fidelity, concurrent load, cold cache,
-WAL checkpoints, ingestion, and qq-core's final verification can dominate. The
+WAL checkpoints, ingestion, exact-source verification, and qq-core's final allow/deny can dominate. The
 validation targets are engineering budgets, not a latency promise. No evidence
 supports attributing or extrapolating the incident's 488.193 seconds to one
 phase without telemetry.
@@ -618,19 +717,17 @@ phase without telemetry.
 Before the complete production design can ship (the daemon/client vertical slice
 itself is already landed):
 
-1. finalize DSH stable event sequence/revision/fingerprint and replay/fence
-   semantics;
-2. freeze document projection, opaque scope-token derivation/rotation and
-   cardinality bounds, FTS5 tokenizer/query escaping, raw posting budget,
-   streaming/dedup behavior, snippet bounds, metadata schema, and deterministic
-   rank golden tests;
-3. evolve the landed serialized Rust UDS service with bounded admission, a
-   reader pool, interrupt/progress cancellation, and connection retirement;
-4. implement explicit backfill/repair and crash/restore tests;
-5. add qq-core's capability-gated adapter and bounded verification separately,
-   without moving policy into qq-index;
-6. run generated correctness, race, fault, restore, concurrency, cancellation,
-   and performance gates, then shadow and soak; and
+1. evolve the bounded multi-client, serialized-core UDS service with a reader
+   pool, active interrupt/progress cancellation, and connection retirement;
+2. add the durable administrative pause/job table beyond the landed in-process
+   adapter lifecycle;
+3. add deletion and targeted current/shadowed surface repair before policy can
+   distinguish those labels;
+4. add production metrics, fault/performance gates, shadow rollout and soak;
+5. mount the capability-gated thin qq-core gesture/grant/bounds/client/final
+   allow-deny adapter and cut over without moving ingestion or reconciliation;
+6. freeze any future projection/token rotation and migration contracts with
+   generated golden/restore tests; and
 7. continue watching Turso only when stable FTS compatibility/migration,
    off-event-loop bindings, supported interrupts, and non-experimental
    durability meet the contract.

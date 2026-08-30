@@ -73,7 +73,8 @@ fn search_operation() -> Value {
         "filters": {
             "authorizedScopeTokens": ["scopegenerated"],
             "workspaceIds": [],
-            "surfaceAllowList": []
+            "surfaceAllowList": [],
+            "eventTypeAllowList": ["message/generated"]
         }
     })
 }
@@ -188,7 +189,38 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
     assert_eq!(applied["response"]["generation"], "1");
     assert_eq!(applied["response"]["insertedDocuments"], 1);
 
-    let search = call(&mut reader, "search-1", search_operation());
+    // Keep the ingest connection open while an independently accepted client reads.
+    let mut search_reader = BufReader::new(connect_bounded(&socket));
+    let source_state = call(
+        &mut search_reader,
+        "source-state-1",
+        json!({
+            "type": "sourceState",
+            "version": "source-state-v1",
+            "sessionIds": ["missing-generated", "generated-session"]
+        }),
+    );
+    assert_eq!(
+        source_state["ok"], true,
+        "sourceState response: {source_state}"
+    );
+    assert_eq!(source_state["response"]["generation"], "1");
+    assert_eq!(source_state["response"]["sourceWatermark"], "1");
+    assert_eq!(
+        source_state["response"]["sessions"][0]["sessionId"],
+        "generated-session"
+    );
+    assert_eq!(source_state["response"]["sessions"][0]["nextSeq"], "1");
+    assert_eq!(
+        source_state["response"]["sessions"][0]["workspaceId"],
+        "workspace-generated"
+    );
+    assert_eq!(
+        source_state["response"]["sessions"][0]["headerRevision"],
+        "generated-revision-1"
+    );
+
+    let search = call(&mut search_reader, "search-1", search_operation());
     assert_eq!(search["ok"], true, "search response: {search}");
     assert_eq!(search["response"]["snapshot"]["generation"], "1");
     assert_eq!(
@@ -206,6 +238,7 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         Some(5)
     );
     assert!(search["response"]["fused"][0]["contributions"][0]["documentKey"].is_string());
+    drop(search_reader);
     shutdown(&mut reader);
     drop(reader);
     daemon
@@ -223,6 +256,16 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
     let mut reader = BufReader::new(connect_bounded(&socket));
     let health = call(&mut reader, "health-2", json!({ "type": "health" }));
     assert_eq!(health["response"]["generation"], "1");
+    let persisted_state = call(
+        &mut reader,
+        "source-state-2",
+        json!({
+            "type": "sourceState",
+            "version": "source-state-v1",
+            "sessionIds": ["generated-session"]
+        }),
+    );
+    assert_eq!(persisted_state["response"]["sessions"][0]["nextSeq"], "1");
     let persisted = call(&mut reader, "search-2", search_operation());
     assert_eq!(
         persisted["response"]["fused"][0]["sessionId"],

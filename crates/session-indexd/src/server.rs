@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,10 +15,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::protocol::{
-    MAX_FRAME_BYTES, MUTATION_BATCH_VERSION, ProtocolError, RequestEnvelope, WireOperation,
-    error_envelope, health_response, into_core_search, parse_request, receipt_response,
-    require_operation_version, require_protocol_version, search_response, shutdown_response,
-    success_envelope,
+    MAX_FRAME_BYTES, MUTATION_BATCH_VERSION, ProtocolError, RequestEnvelope,
+    SOURCE_STATE_VERSION_V1, WireOperation, error_envelope, health_response, into_core_search,
+    parse_request, receipt_response, require_operation_version, require_protocol_version,
+    search_response, shutdown_response, source_state_response, success_envelope,
 };
 
 static SIGNAL_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -25,6 +26,8 @@ const ACCEPT_POLL: Duration = Duration::from_millis(25);
 const CLIENT_READ_POLL: Duration = Duration::from_millis(100);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const INVALID_REQUEST_ID: &str = "invalid";
+/// Hard admission bound for simultaneous UDS client threads.
+pub const MAX_ACTIVE_CLIENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseMode {
@@ -105,27 +108,44 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
 
     // Bind first: an unsafe pre-existing socket target must not create or open a database.
     let (listener, _socket_guard) = bind_private_socket(&config.socket_path)?;
-    let index = match config.database_mode {
+    let index = Arc::new(match config.database_mode {
         DatabaseMode::Create => SessionIndex::create(&config.database_path)?,
         DatabaseMode::Open => SessionIndex::open(&config.database_path)?,
-    };
+    });
 
     listener.set_nonblocking(true).map_err(|error| {
         ServerError::io("setting nonblocking mode on", &config.socket_path, error)
     })?;
 
+    let mut clients = Vec::with_capacity(MAX_ACTIVE_CLIENTS);
     while !SIGNAL_SHUTDOWN.load(Ordering::SeqCst) {
+        reap_finished_clients(&mut clients);
         match listener.accept() {
-            Ok((stream, _address)) => match handle_client(stream, &index) {
-                Ok(true) => SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst),
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "qq-session-indexd: dropping failed client connection: {error}"
-                    );
+            Ok((stream, _address)) => {
+                if clients.len() >= MAX_ACTIVE_CLIENTS {
+                    // Admission is fail-closed and bounded: dropping the stream makes the
+                    // overload visible to the client without creating another thread.
+                    drop(stream);
+                    continue;
                 }
-            },
+                let client_index = Arc::clone(&index);
+                let handle = thread::Builder::new()
+                    .name("qq-session-index-client".to_owned())
+                    .spawn(move || match handle_client(stream, &client_index) {
+                        Ok(true) => SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst),
+                        Ok(false) => {}
+                        Err(error) => {
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "qq-session-indexd: dropping failed client connection: {error}"
+                            );
+                        }
+                    })
+                    .map_err(|error| {
+                        ServerError::io("spawning client thread for", "socket", error)
+                    })?;
+                clients.push(handle);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL);
             }
@@ -139,7 +159,22 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
             }
         }
     }
+    for client in clients {
+        let _ = client.join();
+    }
     Ok(())
+}
+
+fn reap_finished_clients(clients: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < clients.len() {
+        if clients[index].is_finished() {
+            let finished = clients.swap_remove(index);
+            let _ = finished.join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn validate_paths(config: &ServerConfig) -> Result<(), ServerError> {
@@ -334,6 +369,14 @@ fn dispatch(
 
     let (response, should_shutdown) = match request.operation {
         WireOperation::Health => (health_response(&index.metadata()?), false),
+        WireOperation::SourceState {
+            version,
+            session_ids,
+        } => {
+            require_operation_version(&version, SOURCE_STATE_VERSION_V1)?;
+            let state = index.source_state_v1(&session_ids)?;
+            (source_state_response(&state), false)
+        }
         WireOperation::ApplyBatch { version, batch } => {
             require_operation_version(&version, MUTATION_BATCH_VERSION)?;
             let receipt = index.apply_batch(&batch.into_core()?)?;
