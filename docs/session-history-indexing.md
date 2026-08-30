@@ -1,6 +1,6 @@
 # Session-history indexing: engine decision and `SearchBatchV1` contract
 
-Status: **accepted design; Phase 1A core, Phase 1B.1 transport, and Phase 1B.2a qq-index-owned generated/fake DSH adapter implemented; pooled production service not yet implemented**
+Status: **accepted design; Phase 1A core, Phase 1B.1 transport, Phase 1B.2a qq-index-owned generated/fake DSH adapter, and Phase 1B.3 reader pool/active cancellation implemented**
 Decision owner: **qq-index**
 Assessment snapshot: **2026-08-30**
 Turso source pin: [`tursodatabase/turso@6ab76b29a2a1e3d19866e792f2e9929aff65e08d`](https://github.com/tursodatabase/turso/tree/6ab76b29a2a1e3d19866e792f2e9929aff65e08d)
@@ -14,39 +14,46 @@ microbenchmark, not that service and not a production SLO qualification.
 
 ### Implementation status
 
-Phase 1A is implemented in the `qq-session-index-core` Rust library. Phase 1B.1
-adds `qq-session-indexd` and the exported Node client
-`@hypermemetic-ai/qq-index/session-index-client`. Phase 1B.2a adds the exported
-`@hypermemetic-ai/qq-index/session-index-dsh-source` projection/feed and exact
-verification helpers. The daemon owns all SQLite, FTS5, snapshot, and RRF work
-and exposes only a local Unix-domain socket. It requires absolute `--socket` and
-`--database` paths plus exactly one of `--create` or `--open`; opening validates
-the existing index and does not enumerate or reconcile source data.
+Phase 1A is implemented in `qq-session-index-core`. Phase 1B.1 adds the private
+UDS daemon and exported Node client; Phase 1B.2a adds the exported DSH
+projection/feed and exact-verification helpers. Phase 1B.3 lands one dedicated
+writer worker and a fixed read-only reader pool. `--readers` defaults to 4 and is
+bounded to 1–16; `--queue-capacity` defaults to 64 and is bounded to 1–1024.
+Opening validates index/schema/projection identity; readers use read-only,
+no-mutex SQLite flags and do not alter schema or WAL mode.
 
-The landed newline-JSON protocol is `qq-session-index-protocol-v1`, capped at
-1 MiB per frame. Every request has a bounded ASCII request ID and absolute
+The newline-JSON protocol remains `qq-session-index-protocol-v1`, capped at 1
+MiB per frame. Requests carry a bounded request ID and absolute
 `deadlineUnixMs`. Operations are `health`, `sourceState` (`source-state-v1`),
-`applyBatch` (`mutation-batch-v1`), `searchBatch` (`search-batch-v1`), and
-same-UID `shutdown`. Unsigned 64-bit wire
-coordinates are canonical decimal strings so Node never loses precision. Health
-reports schema/projection/search versions, generation/watermark, and these exact
-capabilities: local UDS, serialized requests, a 1 MiB frame maximum, and
-`activeSqliteInterrupt: false`. The socket parent must be owner-only, the socket
-is mode `0600`, pre-existing targets are refused, and shutdown removes only the
-same daemon-owned socket inode.
+`applyBatch` (`mutation-batch-v1`), `searchBatch` (`search-batch-v1`), `cancel`
+(`cancel-v1`), and same-UID `shutdown`. Search terminal errors distinguish
+`cancelled`, `deadline_exceeded`, `admission_rejected`, and storage errors.
+Health reports schema/projection/search/cancel versions, generation/watermark,
+reader count, queue capacity, current/peak active readers, retirement count,
+serialized writer ownership, active SQLite interruption, progress-deadline
+support, local UDS, and frame bound.
 
-This slice retains one serialized core connection, but accepts up to 32 client
-connections concurrently so a long-lived ingest client and independent search
-clients coexist. Deadlines are checked before and after core work; the Node
-client counts queue/socket wait and supports AbortSignal, but disconnecting does
-not interrupt active SQLite. Remaining work is explicit: a reader pool,
-cross-thread `sqlite3_interrupt`/progress cancellation and connection retirement,
-a durable administrative pause/job table, deletion and targeted surface repair,
-production metrics/shadow rollout, and qq-core's thin
-grant/policy/as-of/client/formatting mount and cutover. None runs implicitly
-during open or search. The landed surface remains
-valid only while formatting, strict Clippy, workspace tests, the generated Node
-E2E, and full `npm test` pass.
+Each reader worker owns one connection and runs one entire 1–5-literal batch in
+one transaction/snapshot. Reader jobs overlap on distinct connections while the
+writer may commit in WAL mode. Queue time counts against the deadline. Queued
+cancellation rejects without entering SQLite; active cancellation sets a
+per-request atomic state, calls exactly that reader's rusqlite `InterruptHandle`,
+and is also checked by a cheap SQLite progress callback. A reader is not reused
+until statement unwind/reset and is closed/reopened after a slow unwind.
+
+The Node client retains the socket path and validates active-cancellation health
+capabilities during connect. AbortSignal, deadline, and pending disconnect open
+a separate short-lived control connection, send `cancel-v1`, keep the target
+socket readable, and wait within a bounded grace for the target terminal frame;
+closing only the caller socket is not acknowledgement. Generated tests cover
+two-reader overlap, WAL snapshot stability across a writer commit, queue
+rejection/expiry, active SQLite interruption/isolation/reuse, forced reader
+reopen, Node cancellation acknowledgement under 100 ms, queued Node deadlines,
+and a live DSH source alongside multiple search clients.
+
+Remaining work is a durable administrative pause/job table, deletion and
+targeted surface repair, production metrics/shadow rollout/service supervision,
+and the thin qq-core mount/cutover. None runs implicitly during open or search.
 
 ## Safety and ownership
 
@@ -219,17 +226,15 @@ acceptable only if every SQLite operation and result materialization runs on a
 bounded native worker and its cancellation path can be proved; an async-looking
 JavaScript method is not sufficient.
 
-The following is the target pooled architecture after Phase 1B.1, not a claim
-about the current serialized daemon. The completed first slice has one core
-connection and services requests serially. The eventual service owns:
+Phase 1B.3 implements this pooled architecture. The service owns:
 
 1. one serialized writer connection;
 2. a fixed-size pool of read-only connections, each exclusively owned by a
    dedicated Rust worker/thread;
 3. a coordinator that admits bounded work, accounts deadline queue time, and
    routes cancellation without waiting behind database work; and
-4. checkpoint/migration/backfill workers that never run implicitly on a search
-   or ordinary open path.
+4. no checkpoint, migration, source-reconciliation, or backfill work on a
+   search or ordinary open path.
 
 A worker executes only one request at a time. Different callers get actual
 concurrent reads on different connections and CPU workers. Inside one caller's
@@ -259,21 +264,17 @@ specified by SQLite
 maintenance with latency/size telemetry, never hidden request-path
 reconciliation.
 
-Opening an existing index only validates application/schema versions and reads
-generation/watermark. Phase 1B.1 opens one serialized connection; the later
-pooled service will open its bounded connection pool. It does not list source
-sessions, hash logs, reconcile content, migrate, optimize FTS, or backfill.
+Opening an existing index validates application/schema/projection identity. The
+writer opens read-write and the fixed pool opens read-only/no-mutex connections
+without changing schema or WAL mode. Open does not list source sessions, hash
+logs, reconcile content, migrate, optimize FTS, or backfill.
 
 ### Cancellation, deadlines, and isolation
 
-This subsection specifies the next pooled/cancellable slice. In the landed
-Phase 1B.1 daemon, every request has an absolute wall-clock deadline checked
-before and after serialized core work, queue time counts in the Node client, and
-active interruption is explicitly unsupported.
-
-In the target coordinator, every request has an absolute deadline; the coordinator converts it to a local
-monotonic budget on receipt. Queue time counts. A queued request is removable
-without acquiring a database worker. An active reader has an `InterruptHandle`
+This subsection describes landed Phase 1B.3 behavior. In the coordinator, every
+request has an absolute deadline and waits with a bounded local duration. Queue
+time counts. A queued request is marked terminal and rejected without acquiring
+a database worker. An active reader has an `InterruptHandle`
 owned by the coordinator, so cancellation or deadline expiry invokes
 `sqlite3_interrupt` from outside the worker. A progress handler provides a
 second guard for CPU-heavy VM programs.
@@ -308,8 +309,8 @@ type ResponseEnvelopeV1<T> =
 ```
 
 Unknown versions or capabilities fail closed. Landed terminal error codes are
-`protocol_error`, `unsupported_version`, `invalid_request`, `deadline_exceeded`,
-`forbidden`, `source_watermark_unavailable`, `watermark_conflict`,
+`protocol_error`, `unsupported_version`, `invalid_request`, `cancelled`,
+`deadline_exceeded`, `admission_rejected`, `forbidden`, `source_watermark_unavailable`, `watermark_conflict`,
 `idempotency_conflict`, `mutation_conflict`, and `storage_error`; every error
 also has a bounded message and `retryable` boolean. Sizes, string lengths,
 candidate depths, and list cardinalities have protocol limits even where
@@ -714,21 +715,20 @@ validation targets are engineering budgets, not a latency promise. No evidence
 supports attributing or extrapolating the incident's 488.193 seconds to one
 phase without telemetry.
 
-Before the complete production design can ship (the daemon/client vertical slice
-itself is already landed):
+Before the complete production design can ship (the pooled/cancellable
+daemon/client vertical slice is already landed):
 
-1. evolve the bounded multi-client, serialized-core UDS service with a reader
-   pool, active interrupt/progress cancellation, and connection retirement;
-2. add the durable administrative pause/job table beyond the landed in-process
+1. add the durable administrative pause/job table beyond the landed in-process
    adapter lifecycle;
-3. add deletion and targeted current/shadowed surface repair before policy can
+2. add deletion and targeted current/shadowed surface repair before policy can
    distinguish those labels;
-4. add production metrics, fault/performance gates, shadow rollout and soak;
-5. mount the capability-gated thin qq-core gesture/grant/bounds/client/final
+3. add production metrics, fault/performance gates, shadow rollout, soak, and
+   service supervision;
+4. mount the capability-gated thin qq-core gesture/grant/bounds/client/final
    allow-deny adapter and cut over without moving ingestion or reconciliation;
-6. freeze any future projection/token rotation and migration contracts with
+5. freeze future projection/token rotation and migration contracts with
    generated golden/restore tests; and
-7. continue watching Turso only when stable FTS compatibility/migration,
+6. continue watching Turso only when stable FTS compatibility/migration,
    off-event-loop bindings, supported interrupts, and non-experimental
    durability meet the contract.
 

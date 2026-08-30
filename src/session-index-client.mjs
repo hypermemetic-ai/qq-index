@@ -5,6 +5,7 @@ export const SESSION_INDEX_PROTOCOL_VERSION = "qq-session-index-protocol-v1";
 export const SESSION_INDEX_MUTATION_VERSION = "mutation-batch-v1";
 export const SESSION_INDEX_SEARCH_VERSION = "search-batch-v1";
 export const SESSION_INDEX_SOURCE_STATE_VERSION = "source-state-v1";
+export const SESSION_INDEX_CANCEL_VERSION = "cancel-v1";
 export const SESSION_INDEX_MAX_FRAME_BYTES = 1024 * 1024;
 
 const HEALTH_RESPONSE_VERSION = "health-response-v1";
@@ -12,6 +13,7 @@ const COMMIT_RECEIPT_VERSION = "commit-receipt-v1";
 const SEARCH_RESPONSE_VERSION = "search-batch-response-v1";
 const SHUTDOWN_RESPONSE_VERSION = "shutdown-response-v1";
 const SOURCE_STATE_RESPONSE_VERSION = "source-state-response-v1";
+const CANCEL_RESPONSE_VERSION = "cancel-response-v1";
 const SCHEMA_FINGERPRINT = "qq-session-index-schema-v1";
 const PROJECTION_VERSION = "qq-session-projection-v1";
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -21,11 +23,16 @@ const MAX_DOCUMENTS = 1_024;
 const MAX_SOURCE_STATE_SESSIONS = 32;
 const MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807n;
 const MAX_U64 = 18_446_744_073_709_551_615n;
+const CANCELLATION_GRACE_MS = 250;
+let controlCounter = 0;
+let clientCounter = 0;
 const TERMINAL_ERROR_CODES = new Set([
   "protocol_error",
   "unsupported_version",
   "invalid_request",
   "deadline_exceeded",
+  "cancelled",
+  "admission_rejected",
   "forbidden",
   "source_watermark_unavailable",
   "watermark_conflict",
@@ -46,7 +53,15 @@ export class SessionIndexClientError extends Error {
 
 /** Connect to qq-session-indexd over a private absolute Unix-socket path. */
 export async function connectSessionIndexClient(options) {
-  exactObject(options, ["socketPath"], ["timeoutMs", "deadlineUnixMs", "signal"], "options");
+  exactObject(
+    options,
+    ["socketPath"],
+    ["timeoutMs", "deadlineUnixMs", "signal", "activeCancellation"],
+    "options",
+  );
+  if (options.activeCancellation !== undefined) {
+    boolean(options.activeCancellation, "activeCancellation");
+  }
   boundedString(options.socketPath, "socketPath", 1, 4_096);
   if (!isAbsolute(options.socketPath)) {
     invalid("socketPath must be absolute");
@@ -68,22 +83,45 @@ export async function connectSessionIndexClient(options) {
     socket.destroy();
     throw normalizeSocketError(error, "connecting to session-index daemon");
   }
-  return new SessionIndexClient(socket, defaultTimeoutMs);
+  const client = new SessionIndexClient(
+    socket,
+    options.socketPath,
+    defaultTimeoutMs,
+    options.activeCancellation !== false,
+  );
+  if (options.activeCancellation !== false) {
+    try {
+      await client.health({
+        deadlineUnixMs: boundary.deadlineUnixMs,
+        signal: boundary.signal,
+      });
+    } catch (error) {
+      await client.close();
+      throw error;
+    }
+  }
+  return client;
 }
 
 class SessionIndexClient {
   #socket;
+  #socketPath;
   #defaultTimeoutMs;
+  #activeCancellation;
   #buffer = Buffer.alloc(0);
   #pending = null;
   #tail = Promise.resolve();
   #counter = 0;
+  #clientId;
   #terminalError = null;
   #closed = false;
 
-  constructor(socket, defaultTimeoutMs) {
+  constructor(socket, socketPath, defaultTimeoutMs, activeCancellation) {
     this.#socket = socket;
+    this.#socketPath = socketPath;
     this.#defaultTimeoutMs = defaultTimeoutMs;
+    this.#activeCancellation = activeCancellation;
+    this.#clientId = ++clientCounter;
     socket.on("data", (chunk) => this.#onData(chunk));
     socket.on("error", (error) => this.#terminate(normalizeSocketError(error, "session-index socket")));
     socket.on("end", () => this.#terminate(new SessionIndexClientError(
@@ -156,18 +194,41 @@ class SessionIndexClient {
   async close(options = {}) {
     exactObject(options, [], [], "close options");
     if (this.#closed) return;
+    if (this.#pending && this.#activeCancellation) {
+      const pending = this.#pending;
+      // A disconnect request uses the same independent control path. Keep the
+      // primary socket readable until the target emits its terminal frame.
+      Promise.resolve(sendCancellationControl(
+        this.#socketPath,
+        pending.requestId,
+        "disconnect",
+      )).catch(() => {});
+      await Promise.race([
+        pending.terminal,
+        new Promise((resolveWait) => {
+          const grace = setTimeout(resolveWait, CANCELLATION_GRACE_MS);
+          grace.unref?.();
+        }),
+      ]);
+      if (this.#pending?.requestId === pending.requestId) {
+        this.#terminate(new SessionIndexClientError(
+          "session-index disconnect cancellation was not acknowledged",
+          { code: "cancellation_unacknowledged", retryable: true },
+        ));
+      }
+    } else if (this.#pending) {
+      this.#pending.reject(new SessionIndexClientError(
+        "session-index client closed with a request pending",
+        { code: "client_closed" },
+      ));
+      this.#pending.terminalResolve();
+      this.#pending = null;
+    }
     this.#closed = true;
     const closed = new Promise((resolve) => {
       if (this.#socket.destroyed) resolve();
       else this.#socket.once("close", resolve);
     });
-    if (this.#pending) {
-      this.#pending.reject(new SessionIndexClientError(
-        "session-index client closed with a request pending",
-        { code: "client_closed" },
-      ));
-      this.#pending = null;
-    }
     this.#socket.end();
     const timer = setTimeout(() => this.#socket.destroy(), 1_000);
     timer.unref?.();
@@ -179,6 +240,7 @@ class SessionIndexClient {
     exactObject(options, [], ["timeoutMs", "deadlineUnixMs", "signal"], "request options");
     const boundary = makeBoundary(options, this.#defaultTimeoutMs);
     const previous = this.#tail;
+    let started = false;
     const job = previous.then(() => {
       ensureBoundary(boundary);
       if (this.#closed) {
@@ -187,12 +249,13 @@ class SessionIndexClient {
         });
       }
       if (this.#terminalError) throw this.#terminalError;
+      started = true;
       return this.#roundTrip(operation, validator, boundary);
     });
     this.#tail = job.catch(() => {});
-    // This outer race rejects promptly while a call is queued. The reserved job
-    // remains in the serial tail and checks the same boundary before any write.
-    return raceBoundary(job, boundary);
+    // A queued call rejects without writing. Once started, the round trip owns
+    // its boundary and waits for a daemon terminal cancellation response.
+    return raceQueuedBoundary(job, boundary, () => started);
   }
 
   #roundTrip(operation, validator, boundary) {
@@ -201,7 +264,7 @@ class SessionIndexClient {
         code: "protocol_violation",
       });
     }
-    const requestId = `${process.pid}-${Date.now().toString(36)}-${++this.#counter}`;
+    const requestId = `${process.pid}-${this.#clientId}-${++this.#counter}`;
     identifier(requestId, "requestId");
     const envelope = {
       protocolVersion: SESSION_INDEX_PROTOCOL_VERSION,
@@ -214,19 +277,36 @@ class SessionIndexClient {
       invalid(`request frame exceeds ${SESSION_INDEX_MAX_FRAME_BYTES} bytes`);
     }
 
+    let terminalResolve;
+    const terminal = new Promise((resolveTerminal) => { terminalResolve = resolveTerminal; });
     const response = new Promise((resolve, reject) => {
-      this.#pending = { requestId, validator, resolve, reject };
+      this.#pending = {
+        requestId,
+        validator,
+        resolve,
+        reject,
+        terminal,
+        terminalResolve,
+      };
       this.#socket.write(encoded, (error) => {
         if (error && this.#pending?.requestId === requestId) {
           this.#terminate(normalizeSocketError(error, "writing session-index request"));
         }
       });
     });
-    return raceBoundary(response, boundary, (error) => {
-      // Disconnecting ends the client's wait, but does not claim or imply that
-      // an already-running SQLite operation was interrupted in the daemon.
-      this.#terminate(error);
-    });
+    if (!this.#activeCancellation) {
+      return raceBoundary(response, boundary, (error) => this.#terminate(error));
+    }
+    return activeCancellationBoundary(
+      response,
+      boundary,
+      async (reason) => sendCancellationControl(
+        this.#socketPath,
+        requestId,
+        reason,
+      ),
+      (error) => this.#terminate(error),
+    );
   }
 
   #onData(chunk) {
@@ -279,6 +359,7 @@ class SessionIndexClient {
       envelope = JSON.parse(frame.toString("utf8"));
       validateEnvelope(envelope, pending.requestId);
       this.#pending = null;
+      pending.terminalResolve();
       if (!envelope.ok) {
         const terminal = daemonError(envelope.error, pending.requestId);
         pending.reject(terminal);
@@ -305,6 +386,7 @@ class SessionIndexClient {
       : normalizeSocketError(error, "session-index socket");
     if (this.#pending) {
       this.#pending.reject(this.#terminalError);
+      this.#pending.terminalResolve();
       this.#pending = null;
     }
     this.#socket.destroy();
@@ -363,6 +445,8 @@ function validateHealthResponse(response) {
     "projectionVersion",
     "searchRequestVersion",
     "searchResponseVersion",
+    "cancelRequestVersion",
+    "cancelResponseVersion",
     "generation",
     "sourceWatermark",
     "capabilities",
@@ -375,17 +459,37 @@ function validateHealthResponse(response) {
   equal(response.projectionVersion, PROJECTION_VERSION, "projection version");
   equal(response.searchRequestVersion, SESSION_INDEX_SEARCH_VERSION, "search request version");
   equal(response.searchResponseVersion, SEARCH_RESPONSE_VERSION, "search response version");
+  equal(response.cancelRequestVersion, SESSION_INDEX_CANCEL_VERSION, "cancel request version");
+  equal(response.cancelResponseVersion, CANCEL_RESPONSE_VERSION, "cancel response version");
   unsignedString(response.generation, "generation", MAX_SQLITE_INTEGER);
   unsignedString(response.sourceWatermark, "sourceWatermark", MAX_SQLITE_INTEGER);
   exactObject(response.capabilities, [
     "localUnixSocket",
     "serializedRequests",
+    "serializedWriter",
     "activeSqliteInterrupt",
+    "progressDeadlineSupport",
+    "readerCount",
+    "queueCapacity",
+    "readerRetirements",
+    "activeReaders",
+    "peakActiveReaders",
     "maxFrameBytes",
   ], [], "health capabilities");
   equal(response.capabilities.localUnixSocket, true, "localUnixSocket capability");
-  equal(response.capabilities.serializedRequests, true, "serializedRequests capability");
-  equal(response.capabilities.activeSqliteInterrupt, false, "activeSqliteInterrupt capability");
+  equal(response.capabilities.serializedRequests, false, "serializedRequests capability");
+  equal(response.capabilities.serializedWriter, true, "serializedWriter capability");
+  equal(response.capabilities.activeSqliteInterrupt, true, "activeSqliteInterrupt capability");
+  equal(response.capabilities.progressDeadlineSupport, true, "progressDeadlineSupport capability");
+  boundedInteger(response.capabilities.readerCount, "readerCount", 1, 16);
+  boundedInteger(response.capabilities.queueCapacity, "queueCapacity", 1, 1_024);
+  safeInteger(response.capabilities.readerRetirements, "readerRetirements");
+  if (response.capabilities.readerRetirements < 0) invalid("readerRetirements must be nonnegative");
+  boundedInteger(response.capabilities.activeReaders, "activeReaders", 0, 16);
+  boundedInteger(response.capabilities.peakActiveReaders, "peakActiveReaders", 0, 16);
+  if (response.capabilities.peakActiveReaders < response.capabilities.activeReaders) {
+    invalid("peakActiveReaders must cover activeReaders", "protocol_violation");
+  }
   equal(response.capabilities.maxFrameBytes, SESSION_INDEX_MAX_FRAME_BYTES, "maxFrameBytes");
 }
 
@@ -680,6 +784,198 @@ function validateShutdownResponse(response) {
   exactObject(response, ["type", "version"], [], "shutdown response");
   equal(response.type, "shutdown", "shutdown response type");
   equal(response.version, SHUTDOWN_RESPONSE_VERSION, "shutdown response version");
+}
+
+function raceQueuedBoundary(promise, boundary, started) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      boundary.signal?.removeEventListener("abort", aborted);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const failIfQueued = (error) => {
+      if (started()) {
+        cleanup();
+        return;
+      }
+      finish(reject, error);
+    };
+    const aborted = () => failIfQueued(abortError(boundary.signal?.reason));
+    const timer = setTimeout(
+      () => failIfQueued(deadlineError()),
+      Math.max(0, boundary.deadlineUnixMs - Date.now()),
+    );
+    timer.unref?.();
+    boundary.signal?.addEventListener("abort", aborted, { once: true });
+    if (boundary.signal?.aborted) aborted();
+    Promise.resolve(promise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+function activeCancellationBoundary(response, boundary, sendCancel, onUnacknowledged) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let cancelling = false;
+    let deadlineTimer;
+    let graceTimer;
+    const cleanup = () => {
+      clearTimeout(deadlineTimer);
+      clearTimeout(graceTimer);
+      boundary.signal?.removeEventListener("abort", aborted);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const beginCancellation = (reason, boundaryError) => {
+      if (settled || cancelling) return;
+      cancelling = true;
+      clearTimeout(deadlineTimer);
+      boundary.signal?.removeEventListener("abort", aborted);
+      // The control exchange is deliberately independent of the primary socket.
+      // Its response is useful validation, but only the target terminal frame is
+      // cancellation acknowledgement.
+      Promise.resolve(sendCancel(reason)).catch(() => {});
+      graceTimer = setTimeout(() => {
+        const error = new SessionIndexClientError(
+          "session-index daemon did not acknowledge active cancellation within the bounded grace",
+          {
+            code: "cancellation_unacknowledged",
+            retryable: true,
+            cause: boundaryError,
+          },
+        );
+        onUnacknowledged(error);
+        finish(reject, error);
+      }, CANCELLATION_GRACE_MS);
+      graceTimer.unref?.();
+    };
+    const aborted = () => beginCancellation("caller", abortError(boundary.signal?.reason));
+    deadlineTimer = setTimeout(
+      () => beginCancellation("deadline", deadlineError()),
+      Math.max(0, boundary.deadlineUnixMs - Date.now()),
+    );
+    deadlineTimer.unref?.();
+    boundary.signal?.addEventListener("abort", aborted, { once: true });
+    if (boundary.signal?.aborted) aborted();
+    Promise.resolve(response).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function sendCancellationControl(socketPath, targetRequestId, reason) {
+  const requestId = `cancel-${process.pid}-${Date.now().toString(36)}-${++controlCounter}`;
+  identifier(requestId, "cancel requestId");
+  const deadlineUnixMs = Date.now() + CANCELLATION_GRACE_MS;
+  const envelope = {
+    protocolVersion: SESSION_INDEX_PROTOCOL_VERSION,
+    requestId,
+    deadlineUnixMs,
+    operation: {
+      type: "cancel",
+      version: SESSION_INDEX_CANCEL_VERSION,
+      targetRequestId,
+      reason,
+    },
+  };
+  const response = await oneShotControlRoundTrip(socketPath, envelope, CANCELLATION_GRACE_MS);
+  validateEnvelope(response, requestId);
+  if (!response.ok) throw daemonError(response.error, requestId);
+  validateCancelResponse(response.response, targetRequestId);
+  return response.response;
+}
+
+function oneShotControlRoundTrip(socketPath, envelope, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ path: socketPath });
+    let buffer = Buffer.alloc(0);
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      callback(value);
+    };
+    const timer = setTimeout(() => finish(
+      reject,
+      new SessionIndexClientError("session-index cancellation control timed out", {
+        code: "cancellation_control_timeout",
+        retryable: true,
+      }),
+    ), timeoutMs);
+    timer.unref?.();
+    socket.once("connect", () => socket.write(`${JSON.stringify(envelope)}\n`));
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const newline = buffer.indexOf(0x0a);
+      if (newline === -1) {
+        if (buffer.length > SESSION_INDEX_MAX_FRAME_BYTES) {
+          finish(reject, new SessionIndexClientError(
+            "session-index cancellation response exceeded frame bound",
+            { code: "protocol_violation" },
+          ));
+        }
+        return;
+      }
+      if (newline > SESSION_INDEX_MAX_FRAME_BYTES) {
+        finish(reject, new SessionIndexClientError(
+          "session-index cancellation response exceeded frame bound",
+          { code: "protocol_violation" },
+        ));
+        return;
+      }
+      try {
+        finish(resolve, JSON.parse(buffer.subarray(0, newline).toString("utf8")));
+      } catch (cause) {
+        finish(reject, new SessionIndexClientError(
+          "invalid cancellation response from session-index daemon",
+          { code: "protocol_violation", cause },
+        ));
+      }
+    });
+    socket.once("error", (error) => finish(
+      reject,
+      normalizeSocketError(error, "session-index cancellation control socket"),
+    ));
+    socket.once("end", () => finish(
+      reject,
+      new SessionIndexClientError("session-index cancellation control socket closed", {
+        code: "socket_closed",
+        retryable: true,
+      }),
+    ));
+  });
+}
+
+function validateCancelResponse(response, targetRequestId) {
+  exactObject(response, [
+    "type",
+    "version",
+    "targetRequestId",
+    "state",
+    "cancellationRequested",
+  ], [], "cancel response");
+  equal(response.type, "cancel", "cancel response type");
+  equal(response.version, CANCEL_RESPONSE_VERSION, "cancel response version");
+  equal(response.targetRequestId, targetRequestId, "cancel targetRequestId");
+  if (!["queued", "active", "terminal", "not-found"].includes(response.state)) {
+    invalid("cancel response state is unsupported", "protocol_violation");
+  }
+  boolean(response.cancellationRequested, "cancel response cancellationRequested");
 }
 
 function makeBoundary(options, defaultTimeoutMs) {

@@ -1,17 +1,18 @@
 //! Durable derived storage foundation for qq session-history indexing.
 //!
 //! This crate owns schema validation, incremental projected-document ingestion,
-//! and bounded synchronous batch retrieval on one connection. Reader pooling,
-//! cancellation, daemon transport, DSH projection, and resumable backfill are
-//! deliberately later phases.
+//! bounded synchronous retrieval, and read-only reader connections. Daemon
+//! scheduling/cancellation and DSH projection are layered by the sibling service.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, InterruptHandle, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params,
 };
 use thiserror::Error;
 
@@ -312,11 +313,104 @@ pub struct SourceStateV1 {
 
 /// Single-connection Phase 1A storage core.
 ///
-/// The mutex serializes current operations. A later service milestone will add a
-/// writer and bounded read pool without changing the on-disk contract.
+/// The mutex preserves the Phase 1A embedding API. The daemon owns this value on
+/// its dedicated writer worker and opens separate [`SessionIndexReader`] workers.
 pub struct SessionIndex {
     path: PathBuf,
     connection: Mutex<Connection>,
+}
+
+/// One connection-owning, read-only view of a validated session index.
+///
+/// A reader never creates schema, changes journal mode, performs backfill, or
+/// exposes mutation/source-state operations. It is intentionally `Send` but is
+/// owned by exactly one daemon reader worker at a time.
+pub struct SessionIndexReader {
+    path: PathBuf,
+    connection: Connection,
+}
+
+impl SessionIndexReader {
+    /// Open an existing index with SQLite read-only/no-mutex flags.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(IndexError::NotFound(path));
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // All checks below are reads or connection-local settings. In particular,
+        // do not issue PRAGMA journal_mode=WAL from a reader open.
+        validate_schema(&connection)?;
+        ensure_fts5(&connection)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(IndexError::InvalidSchema(format!(
+                "session index is not in WAL mode: {journal_mode}"
+            )));
+        }
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "trusted_schema", "OFF")?;
+        Ok(Self { path, connection })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read generation/projection metadata without mutating the index.
+    pub fn metadata(&self) -> Result<IndexMetadata, IndexError> {
+        read_metadata(&self.connection)
+    }
+
+    /// Return the thread-safe handle used by the daemon coordinator.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.connection.get_interrupt_handle()
+    }
+
+    /// Execute one 1--5 literal batch in one transaction/snapshot.
+    ///
+    /// The progress callback performs only one relaxed atomic load. Active
+    /// cancellation also calls the connection's `InterruptHandle`; this hook is
+    /// the secondary guard for VM-heavy work and deadline races.
+    pub fn search_batch_v1(
+        &mut self,
+        request: &SearchBatchV1,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<SearchBatchResponseV1, IndexError> {
+        self.connection
+            .progress_handler(1_000, Some(move || cancelled.load(Ordering::Relaxed)));
+        let result = search_batch_v1_on_connection(&mut self.connection, request);
+        self.connection.progress_handler(0, None::<fn() -> bool>);
+        result
+    }
+
+    /// Test-only search coordination at an actual SQLite VM progress callback.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn search_batch_v1_with_test_progress_hook(
+        &mut self,
+        request: &SearchBatchV1,
+        cancelled: Arc<AtomicBool>,
+        progress_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<SearchBatchResponseV1, IndexError> {
+        self.connection.progress_handler(
+            1_000,
+            Some(move || {
+                progress_hook();
+                cancelled.load(Ordering::Relaxed)
+            }),
+        );
+        let result = search_batch_v1_on_connection(&mut self.connection, request);
+        self.connection.progress_handler(0, None::<fn() -> bool>);
+        result
+    }
 }
 
 impl SessionIndex {

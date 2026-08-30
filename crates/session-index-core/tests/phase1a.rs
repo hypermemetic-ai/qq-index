@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use qq_session_index_core::{
     APPLICATION_ID, IndexError, MutationBatch, ProjectedDocument, RAW_POSTING_SCAN_BUDGET_V1,
-    RRF_K_V1, SCHEMA_VERSION, SearchBatchV1, SearchFiltersV1, SessionIndex, SessionSeqBoundV1,
-    SourceTruncationReasonV1,
+    RRF_K_V1, SCHEMA_VERSION, SearchBatchV1, SearchFiltersV1, SessionIndex, SessionIndexReader,
+    SessionSeqBoundV1, SourceTruncationReasonV1,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -716,4 +718,50 @@ fn request_cardinality_lengths_and_ranges_are_strict() {
             Err(IndexError::InvalidSearch(_))
         ));
     }
+}
+
+#[test]
+fn read_only_reader_open_search_and_interrupt_recovery_do_no_source_work() {
+    let (_root, path, writer) = new_index();
+    let documents = (0..300)
+        .map(|index| {
+            projected(
+                &format!("reader-generated-{index}"),
+                0,
+                "common generated reader phrase",
+                &["scopea"],
+            )
+        })
+        .collect();
+    writer
+        .apply_batch(&mutation("reader-contract", 41, documents))
+        .expect("seed generated reader fixture");
+    let before = writer
+        .metadata()
+        .expect("writer metadata before reader open");
+
+    let mut reader = SessionIndexReader::open(&path).expect("open read-only reader");
+    assert_eq!(reader.path(), path);
+    assert_eq!(reader.metadata().expect("reader metadata"), before);
+    let search = request(&["common", "generated"], &["scopea"]);
+    let response = reader
+        .search_batch_v1(&search, Arc::new(AtomicBool::new(false)))
+        .expect("read-only search");
+    assert_eq!(response.snapshot.generation, before.generation);
+    assert_eq!(response.snapshot.source_watermark, 41);
+    assert_eq!(
+        writer.metadata().expect("metadata after reader search"),
+        before
+    );
+
+    let interrupted = reader.search_batch_v1(&search, Arc::new(AtomicBool::new(true)));
+    assert!(
+        matches!(interrupted, Err(IndexError::Sqlite(_))),
+        "progress cancellation must interrupt SQLite: {interrupted:?}"
+    );
+    let recovered = reader
+        .search_batch_v1(&search, Arc::new(AtomicBool::new(false)))
+        .expect("reader is reusable after statement reset");
+    assert_eq!(recovered.snapshot, response.snapshot);
+    assert_eq!(writer.metadata().expect("metadata after interrupt"), before);
 }

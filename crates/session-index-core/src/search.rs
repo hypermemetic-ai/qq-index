@@ -35,8 +35,7 @@ const MAX_SESSION_SEQ_BOUNDS_V1: usize = 128;
 
 /// One synchronous, single-snapshot storage query.
 ///
-/// Request IDs, deadlines, admission, and cancellation belong to the later service
-/// wrapper. This type contains only fields evaluated by the Phase 1A storage core.
+/// Request IDs, deadlines, admission, and cancellation belong to the service wrapper. This type contains only fields evaluated by the Phase 1A storage core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchBatchV1 {
     /// Already-normalized literal phrases. The cardinality is strictly 1 through 5.
@@ -175,6 +174,14 @@ pub(crate) fn search_batch_v1_on_connection(
     connection: &mut Connection,
     request: &SearchBatchV1,
 ) -> Result<SearchBatchResponseV1, IndexError> {
+    search_batch_v1_with_observer(connection, request, &mut |_| {})
+}
+
+fn search_batch_v1_with_observer(
+    connection: &mut Connection,
+    request: &SearchBatchV1,
+    observer: &mut impl FnMut(usize),
+) -> Result<SearchBatchResponseV1, IndexError> {
     validate_search(request)?;
 
     // Deferred is intentional: the metadata read below establishes the WAL snapshot,
@@ -202,6 +209,7 @@ pub(crate) fn search_batch_v1_on_connection(
             request.per_source_depth,
             &request.filters,
         )?);
+        observer(query_ordinal);
     }
 
     let (fused, fused_truncated) = fuse_sources(&sources, request.final_limit);
@@ -591,4 +599,97 @@ fn validate_search_text(name: &str, value: &str, maximum_bytes: usize) -> Result
 
 fn invalid_search<T>(message: impl Into<String>) -> Result<T, IndexError> {
     Err(IndexError::InvalidSearch(message.into()))
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::{MutationBatch, ProjectedDocument, SessionIndex, SessionIndexReader};
+
+    use super::*;
+
+    fn document(seq: u64) -> ProjectedDocument {
+        ProjectedDocument {
+            session_id: "snapshot-generated-session".to_owned(),
+            seq,
+            event_time_unix_ms: 1_700_000_000_000 + i64::try_from(seq).expect("small seq"),
+            event_type: "message/generated".to_owned(),
+            surface: "conversation".to_owned(),
+            workspace_id: "workspace-generated".to_owned(),
+            scope_tokens: vec!["scopegenerated".to_owned()],
+            body: "amber birch cedar delta elm".to_owned(),
+            fingerprint: format!("snapshot-fingerprint-{seq}"),
+            source_revision: format!("snapshot-revision-{seq}"),
+        }
+    }
+
+    fn mutation(key: &str, watermark: u64, document: ProjectedDocument) -> MutationBatch {
+        MutationBatch {
+            idempotency_key: key.to_owned(),
+            payload_fingerprint: format!("snapshot-payload-{key}"),
+            source_watermark: watermark,
+            documents: vec![document],
+        }
+    }
+
+    fn request() -> SearchBatchV1 {
+        SearchBatchV1 {
+            literals: ["amber", "birch", "cedar", "delta", "elm"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            per_source_depth: 10,
+            final_limit: 10,
+            filters: SearchFiltersV1 {
+                authorized_scope_terms: vec!["scopegenerated".to_owned()],
+                ..SearchFiltersV1::default()
+            },
+            minimum_source_watermark: None,
+        }
+    }
+
+    #[test]
+    fn writer_commit_between_literals_does_not_change_reader_snapshot() {
+        let root = tempfile::tempdir().expect("generated temporary directory");
+        let path = root.path().join("snapshot-generated.db");
+        let writer = SessionIndex::create(&path).expect("create generated index");
+        writer
+            .apply_batch(&mutation("initial", 1, document(0)))
+            .expect("seed initial snapshot");
+        let mut reader = SessionIndexReader::open(&path).expect("open read-only reader");
+        let mut committed = false;
+        let response =
+            search_batch_v1_with_observer(&mut reader.connection, &request(), &mut |ordinal| {
+                if ordinal == 0 && !committed {
+                    writer
+                        .apply_batch(&mutation("concurrent", 2, document(1)))
+                        .expect("commit while reader batch is active");
+                    committed = true;
+                }
+            })
+            .expect("five-literal reader snapshot");
+        assert!(committed);
+        assert_eq!(response.snapshot.generation, 1);
+        assert_eq!(response.snapshot.source_watermark, 1);
+        assert!(
+            response
+                .sources
+                .iter()
+                .all(|source| source.raw_postings_scanned == 1)
+        );
+
+        let subsequent = reader
+            .search_batch_v1(&request(), Arc::new(AtomicBool::new(false)))
+            .expect("subsequent snapshot");
+        assert_eq!(subsequent.snapshot.generation, 2);
+        assert_eq!(subsequent.snapshot.source_watermark, 2);
+        assert!(
+            subsequent
+                .sources
+                .iter()
+                .all(|source| source.raw_postings_scanned == 2)
+        );
+    }
 }

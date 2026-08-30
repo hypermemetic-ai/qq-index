@@ -230,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "qq-session-index-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

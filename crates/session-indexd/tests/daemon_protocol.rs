@@ -88,6 +88,8 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         socket_path: socket.clone(),
         database_path: database.clone(),
         database_mode: DatabaseMode::Create,
+        readers: 2,
+        queue_capacity: 8,
     };
     let daemon = start(create_config);
 
@@ -129,7 +131,14 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
     assert_eq!(health["response"]["generation"], "0");
     assert_eq!(
         health["response"]["capabilities"]["activeSqliteInterrupt"],
-        false
+        true
+    );
+    assert_eq!(health["response"]["capabilities"]["readerCount"], 2);
+    assert_eq!(health["response"]["capabilities"]["queueCapacity"], 8);
+    assert_eq!(health["response"]["capabilities"]["serializedWriter"], true);
+    assert_eq!(
+        health["response"]["capabilities"]["progressDeadlineSupport"],
+        true
     );
 
     let invalid = call(
@@ -251,6 +260,8 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         socket_path: socket.clone(),
         database_path: database.clone(),
         database_mode: DatabaseMode::Open,
+        readers: 2,
+        queue_capacity: 8,
     };
     let daemon = start(open_config);
     let mut reader = BufReader::new(connect_bounded(&socket));
@@ -286,6 +297,8 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         socket_path: unsafe_target.clone(),
         database_path: should_not_exist.clone(),
         database_mode: DatabaseMode::Create,
+        readers: 2,
+        queue_capacity: 8,
     })
     .expect_err("pre-existing target must be refused");
     assert!(error.to_string().contains("pre-existing socket target"));
