@@ -11,8 +11,11 @@ assert.equal(plugin.provide, "qq-index");
 assert.equal(typeof plugin.apply, "function");
 assert.equal(typeof plugin.loadIndex, "function");
 assert.equal(typeof plugin.validateIndex, "function");
-assert.equal(plugin.INDEX_MAX_CHARS, 10_000);
+assert.equal(plugin.MAX_INJECTED_INDEX_CODE_POINTS, 10_000);
+assert.equal(plugin.INDEX_MAX_CHARS, plugin.MAX_INJECTED_INDEX_CODE_POINTS);
+assert.match(plugin.INDEX_TRUNCATION_MARKER, /\[README\.md\]\(README\.md\)/);
 assert.equal(typeof plugin.internals.markdownDestinations, "function");
+assert.equal(typeof plugin.internals.projectIndex, "function");
 
 const registrations = [];
 plugin.apply({
