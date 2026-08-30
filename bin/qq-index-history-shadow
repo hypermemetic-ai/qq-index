@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+import { runHistoryShadowCli } from "../src/history-shadow-cli.mjs";
+
+try {
+  const report = await runHistoryShadowCli();
+  if (report?.repositories.some(({ status }) => status === "error")) process.exitCode = 1;
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}
