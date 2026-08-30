@@ -1,6 +1,6 @@
 # Session-history indexing: engine decision and `SearchBatchV1` contract
 
-Status: **accepted design; Phase 1A single-connection core implemented and synthetic tests passing; production service not yet implemented**
+Status: **accepted design; Phase 1A core and Phase 1B.1 serialized UDS daemon/Node client implemented with generated E2E coverage; pooled production service not yet implemented**
 Decision owner: **qq-index**
 Assessment snapshot: **2026-08-30**
 Turso source pin: [`tursodatabase/turso@6ab76b29a2a1e3d19866e792f2e9929aff65e08d`](https://github.com/tursodatabase/turso/tree/6ab76b29a2a1e3d19866e792f2e9929aff65e08d)
@@ -14,18 +14,35 @@ microbenchmark, not that service and not a production SLO qualification.
 
 ### Implementation status
 
-Phase 1A is implemented in the `qq-session-index-core` Rust library and is only
-considered implemented while `cargo fmt --check`, strict workspace clippy, and
-`cargo test --workspace` pass. This milestone is deliberately one synchronous
-connection: it proves the independent versioned database, atomic projected
-mutation/idempotency model, scope-intersected bounded FTS retrieval, one-snapshot
-five-literal search, and deterministic reciprocal-rank fusion. It does **not**
-claim concurrent production serving or active cancellation.
+Phase 1A is implemented in the `qq-session-index-core` Rust library. Phase 1B.1
+adds `qq-session-indexd` and the exported Node client
+`@hypermemetic-ai/qq-index/session-index-client`. The daemon owns all SQLite,
+FTS5, snapshot, and RRF work and exposes only a local Unix-domain socket. It
+requires absolute `--socket` and `--database` paths plus exactly one of
+`--create` or `--open`; opening validates the existing index and does not
+enumerate or reconcile source data.
 
-Remaining Phase 1B+ work is explicit: daemon and UDS protocol, bounded reader
-pool, cross-thread interrupt/deadline coordinator, raw DSH adapter, resumable
-backfill, production metrics, and qq-core shadow cutover. None of those run
-implicitly during `SessionIndex::open` or `search_batch_v1`.
+The landed newline-JSON protocol is `qq-session-index-protocol-v1`, capped at
+1 MiB per frame. Every request has a bounded ASCII request ID and absolute
+`deadlineUnixMs`. Operations are `health`, `applyBatch` (`mutation-batch-v1`),
+`searchBatch` (`search-batch-v1`), and same-UID `shutdown`. Unsigned 64-bit wire
+coordinates are canonical decimal strings so Node never loses precision. Health
+reports schema/projection/search versions, generation/watermark, and these exact
+capabilities: local UDS, serialized requests, a 1 MiB frame maximum, and
+`activeSqliteInterrupt: false`. The socket parent must be owner-only, the socket
+is mode `0600`, pre-existing targets are refused, and shutdown removes only the
+same daemon-owned socket inode.
+
+This slice is deliberately one serialized core connection. Deadlines are checked
+before and after core work; the Node client counts queue/socket wait and supports
+AbortSignal, but disconnecting does not interrupt active SQLite. Remaining work
+is explicit: a bounded reader pool, cross-thread `sqlite3_interrupt`/progress
+cancellation, bounded admission and connection retirement, a DSH projection
+adapter, fenced resumable backfill, live feed and durable checkpoints, production
+metrics, qq-core's thin grant/policy/as-of/client/formatting adapter, and shadow
+cutover. None runs implicitly during open or search. The landed surface remains
+valid only while formatting, strict Clippy, workspace tests, the generated Node
+E2E, and full `npm test` pass.
 
 ## Safety and ownership
 
@@ -195,7 +212,9 @@ acceptable only if every SQLite operation and result materialization runs on a
 bounded native worker and its cancellation path can be proved; an async-looking
 JavaScript method is not sufficient.
 
-The service owns:
+The following is the target pooled architecture after Phase 1B.1, not a claim
+about the current serialized daemon. The completed first slice has one core
+connection and services requests serially. The eventual service owns:
 
 1. one serialized writer connection;
 2. a fixed-size pool of read-only connections, each exclusively owned by a
@@ -233,13 +252,19 @@ specified by SQLite
 maintenance with latency/size telemetry, never hidden request-path
 reconciliation.
 
-Opening an existing index only validates application/schema versions, opens the
-bounded connection pool, and reads generation/watermark. It does not list source
+Opening an existing index only validates application/schema versions and reads
+generation/watermark. Phase 1B.1 opens one serialized connection; the later
+pooled service will open its bounded connection pool. It does not list source
 sessions, hash logs, reconcile content, migrate, optimize FTS, or backfill.
 
 ### Cancellation, deadlines, and isolation
 
-Every request has an absolute deadline; the coordinator converts it to a local
+This subsection specifies the next pooled/cancellable slice. In the landed
+Phase 1B.1 daemon, every request has an absolute wall-clock deadline checked
+before and after serialized core work, queue time counts in the Node client, and
+active interruption is explicitly unsupported.
+
+In the target coordinator, every request has an absolute deadline; the coordinator converts it to a local
 monotonic budget on receipt. Queue time counts. A queued request is removable
 without acquiring a database worker. An active reader has an `InterruptHandle`
 owned by the coordinator, so cancellation or deadline expiry invokes
@@ -257,15 +282,37 @@ request must not interrupt another worker or the writer.
 
 ## Stable policy-neutral API
 
-The transport may use a compact binary encoding, but its semantics are fixed by
-these versioned shapes. Unknown versions or capabilities fail closed. Sizes,
-string lengths, candidate depths, and list cardinalities must have protocol
-limits even where abbreviated below.
+The landed transport uses one newline-terminated JSON object per frame. The frame
+is an envelope; `operation` contains one of the semantic request bodies below:
+
+```ts
+type RequestEnvelopeV1<T> = {
+  protocolVersion: "qq-session-index-protocol-v1";
+  requestId: string;
+  deadlineUnixMs: number;
+  operation: T;
+};
+
+type ResponseEnvelopeV1<T> =
+  | { protocolVersion: "qq-session-index-protocol-v1"; requestId: string;
+      ok: true; response: T }
+  | { protocolVersion: "qq-session-index-protocol-v1"; requestId: string;
+      ok: false; error: { code: string; message: string; retryable: boolean } };
+```
+
+Unknown versions or capabilities fail closed. Landed terminal error codes are
+`protocol_error`, `unsupported_version`, `invalid_request`, `deadline_exceeded`,
+`forbidden`, `source_watermark_unavailable`, `watermark_conflict`,
+`idempotency_conflict`, `mutation_conflict`, and `storage_error`; every error
+also has a bounded message and `retryable` boolean. Sizes, string lengths,
+candidate depths, and list cardinalities have protocol limits even where
+abbreviated below. The Node client creates and validates the envelope, so its `searchBatch`
+method accepts only the `SearchBatchV1` operation body.
 
 ```ts
 type SearchBatchV1 = {
+  type: "searchBatch";         // inserted by the Node client
   version: "search-batch-v1";
-  requestId: string;
   // Already normalized by qq-core. Length must be 1..5.
   literals: string[];
   perSourceDepth: number;
@@ -283,19 +330,18 @@ type SearchBatchV1 = {
     // DSH sequence numbers are session-local. Cardinality is protocol-bounded.
     sessionSeqBounds?: Array<{
       sessionId: string;
-      notBeforeSeq?: number;
-      notAfterSeq?: number;
+      notBeforeSeq?: string;  // canonical u64 decimal
+      notAfterSeq?: string;   // canonical u64 decimal
     }>;
   };
   // If supplied, fail/return unavailable by the deadline rather than silently
   // searching an older generation.
   minimumSourceWatermark?: string;
-  deadlineUnixMs: number;
 };
 
 type SearchBatchResponseV1 = {
+  type: "searchBatch";
   version: "search-batch-response-v1";
-  requestId: string;
   snapshot: {
     generation: string;       // opaque immutable index generation
     sourceWatermark: string;  // source progress included by this snapshot
@@ -313,11 +359,11 @@ type SearchBatchResponseV1 = {
       evidence: {
         sessionId: string;    // self-contained exact-read coordinate
         documentKey: string;
-        seq: number;          // session-local coordinate for exact readEvent
+        seq: string;          // canonical u64 decimal; session-local exact-read coordinate
         eventTimeUnixMs: number;
         eventType: string;
         surface: string;
-        snippet?: string;     // bounded and only from authorized filtered rows
+        snippet: string | null; // bounded; Phase 1B.1 emits null
       };
     }>;
   }>;
@@ -330,8 +376,8 @@ type SearchBatchResponseV1 = {
       sourceRank: number;
       contribution: number;
       documentKey: string;    // best evidence for this source/session
-      seq: number;            // session-local coordinate for exact readEvent
-      snippet?: string;
+      seq: string;            // canonical u64 decimal; session-local exact-read coordinate
+      snippet: string | null;
     }>;
   }>;
   fusedTruncated: boolean;
@@ -380,8 +426,10 @@ reason; the response and metrics report the raw count. Engine progress/deadline
 checks still bound VM work needed to produce a ranked posting. Golden tests fix
 tie-breaking and verify that one session cannot consume unbounded memory.
 
-Terminal protocol failures are also versioned and never return partial results
-from mixed generations:
+The landed response envelope's `error` object is terminal and never accompanies
+partial source data. The richer target error shape below (including optional
+snapshot data and admission/cancel codes) belongs to the next coordinator slice
+and is not advertised by Phase 1B.1:
 
 ```ts
 type SearchBatchErrorV1 = {
@@ -404,7 +452,8 @@ A deadline or cancellation never returns a source list as though it were
 complete. `watermark-unavailable` reports the current non-search snapshot only
 when safe; the client decides whether to retry within a new policy decision.
 
-Cancellation is a separate coordinator message:
+Active cancellation remains a target-only coordinator message; `CancelV1` is not
+implemented or advertised by the landed daemon:
 
 ```ts
 type CancelV1 = {
@@ -566,7 +615,8 @@ validation targets are engineering budgets, not a latency promise. No evidence
 supports attributing or extrapolating the incident's 488.193 seconds to one
 phase without telemetry.
 
-Before implementation can ship:
+Before the complete production design can ship (the daemon/client vertical slice
+itself is already landed):
 
 1. finalize DSH stable event sequence/revision/fingerprint and replay/fence
    semantics;
@@ -574,9 +624,8 @@ Before implementation can ship:
    cardinality bounds, FTS5 tokenizer/query escaping, raw posting budget,
    streaming/dedup behavior, snippet bounds, metadata schema, and deterministic
    rank golden tests;
-3. implement the Rust service, UDS protocol, bounded admission, reader pool,
-   serialized writer, interrupt/progress cancellation, and connection
-   retirement;
+3. evolve the landed serialized Rust UDS service with bounded admission, a
+   reader pool, interrupt/progress cancellation, and connection retirement;
 4. implement explicit backfill/repair and crash/restore tests;
 5. add qq-core's capability-gated adapter and bounded verification separately,
    without moving policy into qq-index;
