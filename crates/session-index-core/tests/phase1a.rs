@@ -259,7 +259,13 @@ fn committed_appends_are_visible_and_advance_one_snapshot() {
         .expect("search committed first append");
     assert_eq!(first_search.snapshot.generation, 1);
     assert_eq!(first_search.snapshot.source_watermark, 10);
-    assert_eq!(first_search.sources[0].ranked[0].evidence.seq, 0);
+    let evidence = &first_search.sources[0].ranked[0].evidence;
+    assert_eq!(evidence.session_id, "session-a");
+    assert_eq!(evidence.seq, 0);
+    assert_eq!(evidence.event_time_unix_ms, 1_000);
+    assert_eq!(evidence.event_type, "message/generated");
+    assert_eq!(evidence.surface, "conversation");
+    assert!(evidence.document_key.starts_with("document-v1:"));
 
     let second = index
         .apply_batch(&mutation(

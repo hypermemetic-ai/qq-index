@@ -125,11 +125,12 @@ pub struct RankedSessionV1 {
     pub evidence: VerificationPointerV1,
 }
 
-/// Stable coordinates needed for a later exact visible-text verification.
+/// Self-contained stable coordinates needed for a later exact visible-text verification.
 ///
 /// Body text is never returned. Phase 1A also emits no snippets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationPointerV1 {
+    pub session_id: String,
     pub document_key: String,
     pub seq: u64,
     pub event_time_unix_ms: i64,
@@ -311,6 +312,7 @@ fn search_one_literal(
                 session_id: session_id.clone(),
                 score: -engine_score,
                 evidence: VerificationPointerV1 {
+                    session_id: session_id.clone(),
                     document_key: stable_document_key(&session_id, seq, &fingerprint),
                     seq,
                     event_time_unix_ms: row.get(2)?,
