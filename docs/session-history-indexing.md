@@ -311,6 +311,7 @@ type SearchBatchResponseV1 = {
       sessionId: string;
       score: number;          // source-local; not comparable across sources
       evidence: {
+        sessionId: string;    // self-contained exact-read coordinate
         documentKey: string;
         seq: number;          // session-local coordinate for exact readEvent
         eventTimeUnixMs: number;
