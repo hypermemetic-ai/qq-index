@@ -112,6 +112,38 @@ try {
     assert.equal(loadIndex(repository), projection, `${description} projection is deterministic`);
   }
 
+  const firstHeadingWithoutLaterBlockBoundary = [
+    ["LF heading", "\n# Title\n", null],
+    ["LF heading and purpose", "\n# Title\nPurpose lives here.\n", "Purpose lives here."],
+    ["CRLF heading", "\r\n# Title\r\n", null],
+    [
+      "CRLF heading and purpose",
+      "\r\n# Title\r\nPurpose lives here.\r\n",
+      "Purpose lives here.",
+    ],
+  ];
+  for (const [description, prefix, purpose] of firstHeadingWithoutLaterBlockBoundary) {
+    const source = `${prefix}${"x".repeat(MAX_INJECTED_INDEX_CODE_POINTS)}`;
+    const projection = internals.projectIndex(source);
+    assertTruncatedProjection(projection);
+    assert.match(projection, /# Title/, `${description} retains the first ATX heading`);
+    if (purpose !== null) {
+      assert.ok(projection.includes(purpose), `${description} retains useful orientation`);
+    }
+    assert.equal(
+      internals.projectIndex(source),
+      projection,
+      `${description} projection is deterministic`,
+    );
+  }
+
+  const leadingBlankFenceProjection = internals.projectIndex(
+    ["", "```text", "x".repeat(MAX_INJECTED_INDEX_CODE_POINTS)].join("\n"),
+  );
+  assertTruncatedProjection(leadingBlankFenceProjection);
+  assert.match(leadingBlankFenceProjection, /    ```text\n/u);
+  assert.match(leadingBlankFenceProjection, /\n~~~\n\n> \*\*qq-index truncation:/u);
+
   const paragraphs = await temporaryRepo();
   await put(paragraphs, "README.md", [
     "Identity paragraph.",

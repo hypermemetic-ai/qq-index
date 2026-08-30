@@ -141,8 +141,10 @@ function markdownBoundaries(markdown) {
   return { block, line, openFence, section };
 }
 
-function latest(values) {
-  return values.length === 0 ? null : values[values.length - 1];
+function latestNonWhitespaceBoundary(markdown, values) {
+  if (values.length === 0) return null;
+  const boundary = values[values.length - 1];
+  return unicodePrefix(markdown, boundary).trim() === "" ? null : boundary;
 }
 
 /*
@@ -202,7 +204,13 @@ function projectIndex(markdown, maximum = MAX_INJECTED_INDEX_CODE_POINTS) {
 
   const candidate = retained.slice(0, bodyBudget).join("");
   const boundaries = markdownBoundaries(candidate);
-  const cutoff = latest(boundaries.section) ?? latest(boundaries.block) ?? latest(boundaries.line);
+  // Structural priority must not let a leading blank outrank a later useful
+  // heading or line. A whitespace-only cutoff would collapse the projection
+  // to its marker and also bypass the safe fallback for an open fence.
+  const cutoff =
+    latestNonWhitespaceBoundary(candidate, boundaries.section) ??
+    latestNonWhitespaceBoundary(candidate, boundaries.block) ??
+    latestNonWhitespaceBoundary(candidate, boundaries.line);
   let body;
 
   if (cutoff !== null) {
