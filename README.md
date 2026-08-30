@@ -12,6 +12,29 @@ npm test
 
 It runs the plugin, index, harvest, history-shadow, synthetic session-history benchmark, writer-boot, and refresh test scripts in that order. The benchmark test requires Python 3 with a standard-library SQLite build that includes FTS5.
 
+## Rust session-index core (Phase 1A)
+
+[`qq-session-index-core`](crates/session-index-core/Cargo.toml) is the single-connection
+`qq-session-index-core` library for the independent, derived SQLite FTS5 index.
+It provides versioned create/open validation, atomic projected-document append,
+and bounded synchronous `search_batch_v1`. It is a storage/retrieval foundation,
+not a concurrent production service: it has no daemon/UDS transport, reader
+pool, interrupt/deadline coordinator, source adapter, backfill worker, metrics,
+or qq-core integration.
+
+The workspace pins mature `rusqlite` with bundled SQLite. Run its required
+quality checks from the repository root (equivalent npm aliases are
+`rust:fmt`, `rust:clippy`, and `rust:test`):
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+All crate tests create fresh temporary generated databases. They must never be
+pointed at real session or corpus paths.
+
 Run the reproducible storage-shape microbenchmark separately:
 
 ```sh
