@@ -11,15 +11,17 @@
   "files": [
     "bin/",
     "config/",
+    "docs/",
     "systemd/",
     "src/",
     "prompts/",
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
+    "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs"
   },
   "bin": {
-    "qq-index-refresh": "bin/qq-index-refresh"
+    "qq-index-refresh": "bin/qq-index-refresh",
+    "qq-index-history-shadow": "bin/qq-index-history-shadow"
   }
 }
