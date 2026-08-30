@@ -8,9 +8,14 @@
 npm test
 npm run benchmark:session-history
 npm run benchmark:session-history:scaled
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-`npm test` is the only declared test script and runs the Node-based suite across the plugin, index, harvest, history-shadow, session-history benchmark, writer-boot, and refresh paths. Both benchmark tasks invoke [`benchmarks/session_history_fts5.py`](benchmarks/session_history_fts5.py) with Python 3; the scaled task adds `--mode scaled`.
+`npm test` runs the Node-based suite across the plugin, index, harvest, history-shadow, session-history benchmark, writer-boot, and refresh paths. Both benchmark tasks invoke [`benchmarks/session_history_fts5.py`](benchmarks/session_history_fts5.py) with Python 3; the scaled task adds `--mode scaled`. The Cargo commands are also available as `npm run rust:fmt`, `npm run rust:clippy`, and `npm run rust:test`.
+
+[`qq-session-index-core`](crates/session-index-core/Cargo.toml) is the Phase 1A single-connection library for the independent derived SQLite FTS5 index. It provides versioned create/open validation, atomic projected-document mutation, and bounded synchronous `search_batch_v1`. It is a storage/retrieval foundation, not a concurrent production service: daemon/UDS transport, a reader pool, interrupt/deadline coordination, a raw DSH adapter, resumable backfill, metrics, qq-core integration, and shadow cutover remain later work. Its tests use only fresh generated temporary databases and must never target real session or corpus paths.
 
 There is no declared start script or repository-specific install script. The package instead declares two executable entry points:
 
@@ -26,6 +31,7 @@ There is no declared start script or repository-specific install script. The pac
 | Refresh-named changes | [`bin/qq-index-refresh`](bin/qq-index-refresh), [`src/refresh.mjs`](src/refresh.mjs) | [`tests/refresh.mjs`](tests/refresh.mjs) |
 | Writer-named artifacts | [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml), [`src/model-pass.mjs`](src/model-pass.mjs), [`src/writer-boot.mjs`](src/writer-boot.mjs) | [`tests/writer-boot.mjs`](tests/writer-boot.mjs) |
 | History shadow and session-history work | [`bin/qq-index-history-shadow`](bin/qq-index-history-shadow), [`src/history-shadow.mjs`](src/history-shadow.mjs) | [`tests/history-shadow.mjs`](tests/history-shadow.mjs), [`docs/session-history-indexing.md`](docs/session-history-indexing.md) |
+| Rust session-index core | [`crates/session-index-core/Cargo.toml`](crates/session-index-core/Cargo.toml), [`crates/session-index-core/src/lib.rs`](crates/session-index-core/src/lib.rs) | `cargo test --workspace` |
 
 [`src/harvest.mjs`](src/harvest.mjs) has the highest recorded relative-module fan-in (four distinct tracked importers), so changes there merit the full test suite. Beyond the package and executable mappings above, file names alone do not establish runtime wiring; confirm imports before treating similarly named files as a pipeline.
 
