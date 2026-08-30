@@ -1,6 +1,6 @@
 # Session-history indexing: engine decision and `SearchBatchV1` contract
 
-Status: **accepted design; production engine not yet implemented**
+Status: **accepted design; Phase 1A single-connection core implemented and synthetic tests passing; production service not yet implemented**
 Decision owner: **qq-index**
 Assessment snapshot: **2026-08-30**
 Turso source pin: [`tursodatabase/turso@6ab76b29a2a1e3d19866e792f2e9929aff65e08d`](https://github.com/tursodatabase/turso/tree/6ab76b29a2a1e3d19866e792f2e9929aff65e08d)
@@ -11,6 +11,21 @@ Database as the first production engine, and selects a Rust service using mature
 upstream SQLite FTS5. It also fixes the versioned, policy-neutral boundary that
 qq-core can adapt to. The checked-in benchmark is a synthetic storage-shape
 microbenchmark, not that service and not a production SLO qualification.
+
+### Implementation status
+
+Phase 1A is implemented in the `qq-session-index-core` Rust library and is only
+considered implemented while `cargo fmt --check`, strict workspace clippy, and
+`cargo test --workspace` pass. This milestone is deliberately one synchronous
+connection: it proves the independent versioned database, atomic projected
+mutation/idempotency model, scope-intersected bounded FTS retrieval, one-snapshot
+five-literal search, and deterministic reciprocal-rank fusion. It does **not**
+claim concurrent production serving or active cancellation.
+
+Remaining Phase 1B+ work is explicit: daemon and UDS protocol, bounded reader
+pool, cross-thread interrupt/deadline coordinator, raw DSH adapter, resumable
+backfill, production metrics, and qq-core shadow cutover. None of those run
+implicitly during `SessionIndex::open` or `search_batch_v1`.
 
 ## Safety and ownership
 

@@ -21,7 +21,10 @@
   "scripts": {
     "test": "node tests/plugin.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs",
     "benchmark:session-history": "python3 benchmarks/session_history_fts5.py",
-    "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled"
+    "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled",
+    "rust:fmt": "cargo fmt --check",
+    "rust:clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:test": "cargo test --workspace"
   },
   "bin": {
     "qq-index-refresh": "bin/qq-index-refresh",
