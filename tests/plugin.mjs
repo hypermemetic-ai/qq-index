@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import * as plugin from "@hypermemetic-ai/qq-index";
+import {
+  deriveWorkspaceScopeToken,
+  verifyDshSearchCandidates,
+} from "@hypermemetic-ai/qq-index/session-index-dsh-source";
 
 assert.equal(plugin.name, "qq-index");
 assert.deepEqual(plugin.inject, []);
@@ -32,7 +36,9 @@ assert.deepEqual(Object.keys(indexService).sort(), ["loadIndex", "validateIndex"
 assert.equal(indexService.loadIndex, plugin.loadIndex);
 assert.equal(indexService.validateIndex, plugin.validateIndex);
 assert.equal(Object.isFrozen(sessionService), true);
-assert.deepEqual(Object.keys(sessionService).sort(), ["health", "ready", "restart", "searchBatch", "status"]);
+assert.deepEqual(Object.keys(sessionService).sort(), ["deriveWorkspaceScopeToken", "health", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
+assert.equal(sessionService.deriveWorkspaceScopeToken, deriveWorkspaceScopeToken);
+assert.equal(sessionService.verifyDshSearchCandidates, verifyDshSearchCandidates);
 assert.equal(sessionService.ready(), false);
 assert.equal(sessionService.status().enabled, false);
 assert.equal(sessionService.status().phase, "disabled");

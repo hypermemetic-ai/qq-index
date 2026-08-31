@@ -582,16 +582,36 @@ error name/code. It contains no query text or session IDs. This lifecycle state
 and live buffer are intentionally in memory; the durable restart authority is
 the daemon's per-session cursor and source watermark.
 
-`verifyDshSearchCandidates` accepts an already-authorized search response,
-literals, and explicit event-type/surface allow lists. Production verification
-prefers `filterEvents(sessionId, [{ kind: 'seq', from, to }])` and requires one
+The plugin's frozen injected `qq-session-index` service exposes the five daemon
+lifecycle/search methods plus the existing canonical policy-neutral helpers
+`deriveWorkspaceScopeToken(workspaceId)` and
+`verifyDshSearchCandidates(options)`. They are the same function objects exported
+by `session-index-dsh-source.mjs`, not service-local implementations. Both remain
+available when the daemon runtime is disabled: derivation is pure, and verification
+uses only the caller-supplied response/query service within its bounds. Disabled
+`searchBatch` remains unavailable. This lets consumers such as qq-core avoid a
+static qq-index package import, but does not claim the sibling `/find-session`
+cutover is complete.
+
+`verifyDshSearchCandidates({ searchResponse, sessionQuery, literals,
+eventTypeAllowList, surfaceAllowList, maxConcurrency?, maxCandidates?, signal?,
+extractSessionEventText? })` accepts an already-authorized search response and
+explicit event-type/surface allow lists. Production verification prefers
+`filterEvents(sessionId, [{ kind: 'seq', from, to }])` and requires one
 authoritative semantic document with matching coordinate, type, surface, and
-literal text. The generated `readEvent` form remains a fallback only; a real raw
-`readEvent({ sessionId, seq, before, after }).target` has no authoritative
-surface and cannot alone verify evidence. The helper deduplicates coordinates,
-bounds exact-read concurrency/cardinality, and fails closed on missing, stale,
-duplicate, malformed, or mismatched source observations. It does not authorize
-a workspace, session, type, or surface.
+literal text. rc.7 does not define a signal parameter for `filterEvents`, so an
+abort stops new work and rejects after the current at-most-`maxConcurrency` reads
+settle. Its `readEvent(request, signal?)` form does support the signal in the
+second position. The generated positional `readEvent(sessionId, seq)` form remains
+a fallback only and receives no new argument; a real raw
+`readEvent({ sessionId, seq, before, after }).target` has no authoritative surface
+and cannot alone verify evidence. The helper checks cancellation before scheduling,
+throughout worker/output loops, and around reads. Cancellation and abort failures
+reject the whole verification—never a successful partial response—while ordinary
+read failures remain fail-closed omissions. It deduplicates coordinates, bounds
+exact-read concurrency/cardinality, and fails closed on missing, stale, duplicate,
+malformed, or mismatched source observations. It does not authorize a workspace,
+session, type, or surface.
 
 The production mount and supervision contract is documented in
 [`session-index-production.md`](session-index-production.md). This bridge remains append-only. Source replacement can leave earlier

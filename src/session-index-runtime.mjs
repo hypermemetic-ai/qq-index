@@ -1,7 +1,11 @@
 import { isAbsolute } from "node:path";
 
 import { connectSessionIndexClient } from "./session-index-client.mjs";
-import { createDshSessionIndexSource } from "./session-index-dsh-source.mjs";
+import {
+  createDshSessionIndexSource,
+  deriveWorkspaceScopeToken,
+  verifyDshSearchCandidates,
+} from "./session-index-dsh-source.mjs";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 2_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -163,6 +167,8 @@ class SessionIndexRuntime {
       health: (options) => this.health(options),
       searchBatch: (request, options) => this.searchBatch(request, options),
       restart: () => this.restart(),
+      deriveWorkspaceScopeToken,
+      verifyDshSearchCandidates,
     });
   }
 
