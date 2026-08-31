@@ -534,7 +534,7 @@ all live sessions.
 
 ```js
 const source = createDshSessionIndexSource({
-  sessionQuery,             // listSessions(signal), readSession(sessionId)
+  sessionQuery,             // SessionRecord.header.id; readSession -> { session, events }
   subscribe,                // listener for global session/* notifications
   clientFactory,            // returns a session-index client
   projectionHelpers: {
@@ -546,19 +546,24 @@ const source = createDshSessionIndexSource({
 await source.start();        // fenced corpus scan, catch-up, then live
 await source.sync();         // explicit later corpus rescan
 source.status();             // bounded phase/count/watermark/error class only
+await source.health();       // bounded probe of its dedicated writer connection
 await source.pause();        // in-process lifecycle pause
 await source.close();
 ```
 
-When helpers are not injected, the module dynamically imports the public
-`@deepseek-ai/dsh-session-query` mechanical helpers. Tests inject generated
-implementations and never open a real DSH path. Projection validates the complete
-raw record log as ordered and contiguous from sequence zero. It emits one index
-row for every raw sequence: semantic search documents supply extracted body
-text, while structural/omitted records get an empty, non-matching body. Event
-type, time, surface, workspace and raw sequence are retained. Domain-separated
-SHA-256 fingerprints and source revisions cover the canonical generated fields.
-No grant is projected.
+When helpers are not injected, the module dynamically imports the exactly pinned
+`@deepseek-ai/dsh-session-query@0.1.0-rc.7` package. Production projection calls
+`buildSessionEventRecords(sessionId, events)` and
+`buildSessionEventSearchDocuments(sessionId, events)`; generated compatibility
+shapes remain supported. Generated tests exercise the actual pinned helpers and
+never open a real DSH path. Projection validates the complete raw record log as
+ordered and contiguous from sequence zero. It emits one index row for every raw
+sequence: semantic documents supply their authoritative `text`, while
+structural/omitted records get an empty, non-matching body. Production `type`,
+`time`, `surface`, `session.cwd`, and raw sequence are retained. Missing or
+non-absolute production cwd is skipped rather than assigned a global scope.
+Domain-separated SHA-256 fingerprints and source revisions cover the canonical
+generated fields. No grant is projected.
 
 `start()` installs the live subscription before `listSessions(signal)`. It reads
 bounded daemon `sourceState` snapshots, fully validates every listed current log,
@@ -578,13 +583,18 @@ and live buffer are intentionally in memory; the durable restart authority is
 the daemon's per-session cursor and source watermark.
 
 `verifyDshSearchCandidates` accepts an already-authorized search response,
-literals, explicit event-type/surface allow lists, and `readEvent`/text extraction.
-It deduplicates `(sessionId, seq)`, bounds exact-read concurrency/cardinality,
-requires literal presence and pointer/source type/surface agreement, and returns
-only verified candidates/evidence. Missing or stale source events fail closed.
-The helper does not authorize a workspace, session, type, or surface.
+literals, and explicit event-type/surface allow lists. Production verification
+prefers `filterEvents(sessionId, [{ kind: 'seq', from, to }])` and requires one
+authoritative semantic document with matching coordinate, type, surface, and
+literal text. The generated `readEvent` form remains a fallback only; a real raw
+`readEvent({ sessionId, seq, before, after }).target` has no authoritative
+surface and cannot alone verify evidence. The helper deduplicates coordinates,
+bounds exact-read concurrency/cardinality, and fails closed on missing, stale,
+duplicate, malformed, or mismatched source observations. It does not authorize
+a workspace, session, type, or surface.
 
-This first bridge is append-only. Source replacement can leave earlier
+The production mount and supervision contract is documented in
+[`session-index-production.md`](session-index-production.md). This bridge remains append-only. Source replacement can leave earlier
 current/shadowed conversation labels stale, which is acceptable only while
 `/find-session` allows both labels. Targeted surface repair is scheduled and
 must land before policy

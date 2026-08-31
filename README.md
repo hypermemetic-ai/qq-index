@@ -17,13 +17,15 @@ npm run daemon:build
 npm run daemon:test
 ```
 
-The declared benchmarks are `npm run benchmark:session-history` and `npm run benchmark:session-history:scaled`. The package also exposes `qq-index-refresh` and `qq-index-history-shadow` through [`bin/qq-index-refresh`](bin/qq-index-refresh) and [`bin/qq-index-history-shadow`](bin/qq-index-history-shadow).
+The declared benchmarks are `npm run benchmark:session-history` and `npm run benchmark:session-history:scaled`. The package exposes `qq-index-refresh`, `qq-index-history-shadow`, and the safety-checking `qq-session-indexd-launch` supervisor through [`bin/`](bin/qq-session-indexd-launch).
+
+The production session-index service is explicitly opt-in. Its exact plugin contract, bounded configuration, daemon build/user-unit installation, overrides, recovery behavior, and rollback procedure are documented in [`docs/session-index-production.md`](docs/session-index-production.md). The dedicated [`systemd/user/qq-session-indexd.service`](systemd/user/qq-session-indexd.service) does not replace the existing README refresh unit/timer.
 
 ## Repository map
 
 - **Node package:** [`src/plugin.mjs`](src/plugin.mjs) is the main export. The other public exports are [`src/session-index-client.mjs`](src/session-index-client.mjs) and [`src/session-index-dsh-source.mjs`](src/session-index-dsh-source.mjs). Frequently imported internal modules include [`src/harvest.mjs`](src/harvest.mjs), [`src/index.mjs`](src/index.mjs), [`src/model-pass.mjs`](src/model-pass.mjs), and [`src/refresh.mjs`](src/refresh.mjs).
 - **Rust workspace:** [`Cargo.toml`](Cargo.toml) is the workspace root. The two crate boundaries are [`crates/session-index-core`](crates/session-index-core/Cargo.toml) and [`crates/session-indexd`](crates/session-indexd/Cargo.toml).
-- **Operational entry points:** command wrappers are under [`bin/`](bin/qq-index-refresh), while the tracked user service and timer are [`systemd/user/qq-index.service`](systemd/user/qq-index.service) and [`systemd/user/qq-index.timer`](systemd/user/qq-index.timer).
+- **Operational entry points:** command wrappers are under [`bin/`](bin/qq-index-refresh). The README refresh user service/timer remain [`qq-index.service`](systemd/user/qq-index.service) and [`qq-index.timer`](systemd/user/qq-index.timer); the separately supervised daemon is [`qq-session-indexd.service`](systemd/user/qq-session-indexd.service).
 - **Writer inputs:** start with [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml), and [`config/repositories`](config/repositories).
 
 Because the package is ESM (`"type": "module"`), preserve ESM module conventions. Treat the `main`, `exports`, `bin`, and `scripts` fields in [`package.json`](package.json) as the authoritative package surface and task list.
