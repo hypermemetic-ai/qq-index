@@ -1,63 +1,43 @@
 # qq-index
 
-`@hypermemetic-ai/qq-index` is a private ECMAScript-module package whose declared purpose is **bounded repository orientation in `README.md`**. Its package entry and root export are both [`src/plugin.mjs`](src/plugin.mjs); [`package.json`](package.json) is authoritative for the package surface and scripts.
+`@hypermemetic-ai/qq-index` is a private ESM package for bounded repository orientation in `README.md`. Its public Node entry point is [`src/plugin.mjs`](src/plugin.mjs); the package also exports the [session-index client](src/session-index-client.mjs) and [DSH source](src/session-index-dsh-source.mjs).
 
 ## Run and verify
 
+The package manifest defines no project-specific install/bootstrap or `start` script. Use its declared tasks:
+
 ```sh
-npm test
-npm run benchmark:session-history
-npm run benchmark:session-history:scaled
+npm test                              # complete declared Node and end-to-end suite
+npm run test:session-index-e2e        # session-index client end to end
+npm run test:session-index-dsh-e2e    # DSH source end to end
+npm run rust:fmt
+npm run rust:clippy
+npm run rust:test
 npm run daemon:build
 npm run daemon:test
-npm run test:session-index-e2e
-npm run test:session-index-dsh-e2e
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
 ```
 
-`npm test` runs the Node-based suite across the plugin, index, harvest, history-shadow, session-history benchmark, writer-boot, refresh, and daemon/client E2E paths. Both benchmark tasks invoke [`benchmarks/session_history_fts5.py`](benchmarks/session_history_fts5.py) with Python 3; the scaled task adds `--mode scaled`. The Cargo commands are also available as `npm run rust:fmt`, `npm run rust:clippy`, and `npm run rust:test`.
+The declared benchmarks are `npm run benchmark:session-history` and `npm run benchmark:session-history:scaled`. The package also exposes `qq-index-refresh` and `qq-index-history-shadow` through [`bin/qq-index-refresh`](bin/qq-index-refresh) and [`bin/qq-index-history-shadow`](bin/qq-index-history-shadow).
 
-[`qq-session-index-core`](crates/session-index-core/Cargo.toml) owns the independent derived SQLite FTS5 index, including the mutable writer core and the read-only `SessionIndexReader`. Phase 1B adds the [`qq-session-indexd`](crates/session-indexd/Cargo.toml) binary and the package subpaths [`@hypermemetic-ai/qq-index/session-index-client`](src/session-index-client.mjs) and [`@hypermemetic-ai/qq-index/session-index-dsh-source`](src/session-index-dsh-source.mjs). The daemon accepts explicit `--socket`, `--database`, exactly one of `--create`/`--open`, bounded `--readers` (default 4, range 1–16), and bounded `--queue-capacity` (default 64, range 1–1024). It listens only on a private Unix-domain socket, accepts up to 32 concurrent clients, and serves bounded versioned `health`, `sourceState`, `applyBatch`, `searchBatch`, `cancel`, and same-UID `shutdown` requests. For example:
+## Repository map
 
-```sh
-cargo run --package qq-session-indexd -- \
-  --socket /absolute/private/runtime/index.sock \
-  --database /absolute/private/index.db \
-  --create \
-  --readers 4 \
-  --queue-capacity 64
-```
+- **Node package:** [`src/plugin.mjs`](src/plugin.mjs) is the main export. The other public exports are [`src/session-index-client.mjs`](src/session-index-client.mjs) and [`src/session-index-dsh-source.mjs`](src/session-index-dsh-source.mjs). Frequently imported internal modules include [`src/harvest.mjs`](src/harvest.mjs), [`src/index.mjs`](src/index.mjs), [`src/model-pass.mjs`](src/model-pass.mjs), and [`src/refresh.mjs`](src/refresh.mjs).
+- **Rust workspace:** [`Cargo.toml`](Cargo.toml) is the workspace root. The two crate boundaries are [`crates/session-index-core`](crates/session-index-core/Cargo.toml) and [`crates/session-indexd`](crates/session-indexd/Cargo.toml).
+- **Operational entry points:** command wrappers are under [`bin/`](bin/qq-index-refresh), while the tracked user service and timer are [`systemd/user/qq-index.service`](systemd/user/qq-index.service) and [`systemd/user/qq-index.timer`](systemd/user/qq-index.timer).
+- **Writer inputs:** start with [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml), and [`config/repositories`](config/repositories).
 
-SQLite, FTS, and RRF execute only in Rust. One dedicated writer worker owns the mutable connection; a fixed reader pool owns one read-only/no-mutex connection per worker and runs independent search batches concurrently. Queue time counts against absolute deadlines. `cancel-v1` removes queued searches or sets their atomic cancellation state and invokes the active reader's connection-specific rusqlite `InterruptHandle`; a cheap SQLite progress handler is the secondary guard. Interrupted workers are not reused until statement unwind/reset and are reopened after a slow unwind. Health advertises reader/queue bounds, active/peak readers, retirement count, `activeSqliteInterrupt: true`, progress-deadline support, and serialized writer ownership. The Node client validates these capabilities, sends abort/deadline/disconnect cancellation over an independent short-lived socket, and waits boundedly for the target terminal response. The DSH source module supplies `createDshSessionIndexSource`, `projectDshSessionLog`, `deriveWorkspaceScopeToken`, and `verifyDshSearchCandidates`. It subscribes before listing, projects one row per contiguous raw sequence (empty body for structural events), resumes from durable `sourceState` cursors, chunks deterministic idempotent batches, and rereads live sessions through one bounded serialized queue. `status()` exposes only bounded phase/count/watermark/error-class data, never query text or session IDs.
+Because the package is ESM (`"type": "module"`), preserve ESM module conventions. Treat the `main`, `exports`, `bin`, and `scripts` fields in [`package.json`](package.json) as the authoritative package surface and task list.
 
-The scope token is `w` plus 63 lowercase hex characters from a domain-separated SHA-256 digest of the workspace ID. Derivation is mechanical and exported so a thin qq-core adapter can compute the token for an already-authorized workspace; it does not encode a grant or decide authorization. Search now has a bounded `eventTypeAllowList` SQL predicate in addition to surface/workspace/session/as-of bounds.
+## Change routing
 
-This remains an append-only bridge. Replacement events can leave old current/shadowed surface labels until targeted repair lands; callers must allow both conversation labels wherever policy does not distinguish them. `session/disposed` never blindly deletes because source persistence may still own the log; it is recorded for a later corpus sync, and stale hits must fail the exported exact-read verifier. Remaining work is a durable administrative pause/job table, deletion and targeted surface repair, production metrics/shadow rollout/service supervision, and the thin qq-core mount/cutover. All tests use only fresh generated temporary databases and unrelated generated literals; they must never target real session or corpus paths.
-
-There is no declared start script or repository-specific install script. The package instead declares two executable entry points:
-
-- `qq-index-refresh` → [`bin/qq-index-refresh`](bin/qq-index-refresh)
-- `qq-index-history-shadow` → [`bin/qq-index-history-shadow`](bin/qq-index-history-shadow)
-
-## Map and route changes
-
-| Area | First files to inspect | Verification or detail |
+| Change area | Start with | Relevant verification |
 | --- | --- | --- |
-| Package integration | [`src/plugin.mjs`](src/plugin.mjs) | [`tests/plugin.mjs`](tests/plugin.mjs) |
-| Index and harvest paths | [`src/index.mjs`](src/index.mjs), [`src/harvest.mjs`](src/harvest.mjs) | [`tests/index.mjs`](tests/index.mjs), [`tests/harvest.mjs`](tests/harvest.mjs) |
-| Refresh-named changes | [`bin/qq-index-refresh`](bin/qq-index-refresh), [`src/refresh.mjs`](src/refresh.mjs) | [`tests/refresh.mjs`](tests/refresh.mjs) |
-| Writer-named artifacts | [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml), [`src/model-pass.mjs`](src/model-pass.mjs), [`src/writer-boot.mjs`](src/writer-boot.mjs) | [`tests/writer-boot.mjs`](tests/writer-boot.mjs) |
-| History shadow and session-history work | [`bin/qq-index-history-shadow`](bin/qq-index-history-shadow), [`src/history-shadow.mjs`](src/history-shadow.mjs) | [`tests/history-shadow.mjs`](tests/history-shadow.mjs), [`docs/session-history-indexing.md`](docs/session-history-indexing.md) |
-| Rust session-index core | [`crates/session-index-core/Cargo.toml`](crates/session-index-core/Cargo.toml), [`crates/session-index-core/src/lib.rs`](crates/session-index-core/src/lib.rs) | `cargo test --workspace` |
-| Session-index daemon and Node client | [`crates/session-indexd/src/main.rs`](crates/session-indexd/src/main.rs), [`src/session-index-client.mjs`](src/session-index-client.mjs) | `npm run test:session-index-e2e` |
-| DSH source projection/feed and exact verification | [`src/session-index-dsh-source.mjs`](src/session-index-dsh-source.mjs) | `npm run test:session-index-dsh-e2e` (generated/fake source only) |
+| Plugin/package entry | [`src/plugin.mjs`](src/plugin.mjs), [`package.json`](package.json) | [`tests/plugin.mjs`](tests/plugin.mjs) |
+| Index, harvest, or refresh | [`src/index.mjs`](src/index.mjs), [`src/harvest.mjs`](src/harvest.mjs), [`src/refresh.mjs`](src/refresh.mjs) | [`tests/index.mjs`](tests/index.mjs), [`tests/harvest.mjs`](tests/harvest.mjs), [`tests/refresh.mjs`](tests/refresh.mjs) |
+| Writer boot/model pass | [`src/writer-boot.mjs`](src/writer-boot.mjs), [`src/model-pass.mjs`](src/model-pass.mjs) | [`tests/writer-boot.mjs`](tests/writer-boot.mjs) |
+| History shadow | [`src/history-shadow.mjs`](src/history-shadow.mjs), [`src/history-shadow-cli.mjs`](src/history-shadow-cli.mjs) | [`tests/history-shadow.mjs`](tests/history-shadow.mjs), [experiment notes](docs/history-shadow-experiment.md) |
+| Session-index JS exports | [`src/session-index-client.mjs`](src/session-index-client.mjs), [`src/session-index-dsh-source.mjs`](src/session-index-dsh-source.mjs) | [`tests/session-index-client.e2e.mjs`](tests/session-index-client.e2e.mjs), [`tests/session-index-dsh-source.e2e.mjs`](tests/session-index-dsh-source.e2e.mjs) |
+| Rust core/search | [`crates/session-index-core/src/lib.rs`](crates/session-index-core/src/lib.rs), [`crates/session-index-core/src/search.rs`](crates/session-index-core/src/search.rs) | [`crates/session-index-core/tests/phase1a.rs`](crates/session-index-core/tests/phase1a.rs) |
+| Rust daemon/protocol | [`crates/session-indexd/src/lib.rs`](crates/session-indexd/src/lib.rs), [`crates/session-indexd/src/protocol.rs`](crates/session-indexd/src/protocol.rs), [`crates/session-indexd/src/server.rs`](crates/session-indexd/src/server.rs) | [`crates/session-indexd/tests/daemon_protocol.rs`](crates/session-indexd/tests/daemon_protocol.rs) |
 
-[`src/harvest.mjs`](src/harvest.mjs) has the highest recorded relative-module fan-in (four distinct tracked importers), so changes there merit the full test suite. Beyond the package and executable mappings above, file names alone do not establish runtime wiring; confirm imports before treating similarly named files as a pipeline.
-
-## Existing operational detail
-
-- Session-history design and experiment notes: [`docs/session-history-indexing.md`](docs/session-history-indexing.md) and [`docs/history-shadow-experiment.md`](docs/history-shadow-experiment.md).
-- Repository and writer configuration: [`config/repositories`](config/repositories) and [`config/writer.patch.yml`](config/writer.patch.yml).
-- Tracked systemd user units: [`systemd/user/qq-index.service`](systemd/user/qq-index.service) and [`systemd/user/qq-index.timer`](systemd/user/qq-index.timer). No enable/start procedure is declared in the package scripts.
+For the repository's session-history design detail, read [`docs/session-history-indexing.md`](docs/session-history-indexing.md).
