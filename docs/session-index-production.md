@@ -1,6 +1,6 @@
 # Production session-index runtime and daemon
 
-This is the production lifecycle for QQ's derived DSH session-history index. It is separate from the existing `qq-index` README refresh service and timer. It does not grant workspace access or make an index hit authoritative; qq-core remains responsible for authorization and presentation, and exact DSH verification remains required for returned candidates.
+This is the production lifecycle for QQ's derived DSH session-history index. It is separate from the existing `qq-index` README refresh service and timer. It does not grant workspace access or make an index hit authoritative; qq-core remains responsible for authorization and presentation, and exact DSH verification remains required for returned candidates. The injected canonical helpers provide a package-resolution-independent boundary for consumers such as qq-core; this repository change does not by itself claim that qq-core's `/find-session` cutover is complete.
 
 ## Plugin configuration and service contract
 
@@ -11,6 +11,8 @@ The plugin still has `name = "qq-index"`, `inject = []`, `provide = "qq-index"`,
 - `health({ timeoutMs?, deadlineUnixMs?, signal? }?)` opens a short-lived client, validates daemon health, returns the validated path-free health response, and always closes the client. It may be used while the source is recovering; it is not readiness.
 - `searchBatch(request, { timeoutMs?, deadlineUnixMs?, signal? }?)` is the policy-neutral daemon request. It fails closed unless ready and capability-valid, opens one independent short-lived client per call, forwards abort/deadline controls, and always closes it. Concurrent calls can therefore occupy different daemon readers; the source writer connection is never used for search.
 - `restart()` serializes callers onto one immediate source/daemon reattachment. It fails closed when disabled, disposing, or `sessionQuery` is absent.
+- `deriveWorkspaceScopeToken(workspaceId)` is the canonical policy-neutral, domain-separated workspace identity derivation used at ingest. The service property is the existing exported helper itself, not a duplicate implementation.
+- `verifyDshSearchCandidates({ searchResponse, sessionQuery, literals, eventTypeAllowList, surfaceAllowList, maxConcurrency?, maxCandidates?, signal?, extractSessionEventText? })` is the canonical bounded exact-source verifier. It omits stale, malformed, mismatched, or ordinarily unreadable evidence; cancellation rejects the complete operation rather than returning partial candidates. The service property is the existing exported helper itself.
 
 Session indexing is inert unless the boolean is exactly true. Enabled configuration requires an explicit absolute socket path:
 
@@ -33,7 +35,7 @@ Session indexing is inert unless the boolean is exactly true. Enabled configurat
 }
 ```
 
-With `enabled: false` or no `sessionIndex` block, the capability service reports `disabled` and no injection, timer, socket, database, corpus list/read, daemon, or client is touched. With `enabled: true` but no optional `sessionQuery` service, it reports `waiting-session-query`; the original README service continues to work.
+With `enabled: false` or no `sessionIndex` block, the capability service reports `disabled` and no injection, timer, socket, database, corpus list/read, daemon, or client is touched. The pure `deriveWorkspaceScopeToken` and caller-supplied, bounded `verifyDshSearchCandidates` capabilities remain available in this state; they do not depend on daemon lifecycle or readiness. `searchBatch`, `health`, and `restart` continue to reject as disabled. With `enabled: true` but no optional `sessionQuery` service, it reports `waiting-session-query`; the original README service continues to work.
 
 The runtime uses Cordis `ctx.inject(["sessionQuery"], ...)`, subscribes to `session/created`, `session/event`, and `session/disposed` before listing, and removes all three listeners when the injected generation or plugin is disposed. One unref'd monitor/backoff timer probes the dedicated writer connection. A daemon restart invalidates that connection, makes searches fail closed, and triggers bounded reattachment without restarting the DSH host.
 
@@ -43,7 +45,7 @@ The runtime uses Cordis `ctx.inject(["sessionQuery"], ...)`, subscribes to `sess
 
 The source accepts production `SessionRecord.header.id` listings and `readSession(id) -> { session, events }`. It calls both projection helpers as `(sessionId, events)`, uses record/document `type`, `time`, and `surface`, and uses semantic-document `text` as authoritative. Every contiguous raw sequence still receives an index row; structural rows have an empty body. `session.cwd` must be a usable absolute workspace identity. A missing or relative production cwd is skipped and never receives a global scope. The existing opaque digest token is derived from cwd without exposing it.
 
-Exact verification prefers `filterEvents(sessionId, [{ kind: "seq", from, to }])`, then requires one matching coordinate and matching indexed/current type, surface, and literal text. Missing, stale, duplicate, malformed, or mismatched observations fail closed. The old generated `readEvent` shape remains only as a compatibility fallback; a real raw `readEvent({ sessionId, seq, before, after }).target` has no authoritative surface and therefore cannot by itself authorize evidence.
+Exact verification prefers `filterEvents(sessionId, [{ kind: "seq", from, to }])`, then requires one matching coordinate and matching indexed/current type, surface, and literal text. Its optional standard `AbortSignal` is checked before scheduling, throughout bounded worker loops, around reads, and before output. rc.7 `filterEvents` has no signal position, so abort stops new work and rejects after the at-most-`maxConcurrency` current reads settle; rc.7 `readEvent(request, signal?)` receives the signal in its supported second position. Missing, stale, duplicate, malformed, or mismatched observations fail closed. The old generated `readEvent` shape remains only as a compatibility fallback; a real raw `readEvent({ sessionId, seq, before, after }).target` has no authoritative surface and therefore cannot by itself authorize evidence.
 
 Current caveat: disposal does not delete durable rows and targeted surface repair is not implemented. Such current/shadowed/stale hits remain candidates only and must pass exact current-source verification. This is intentionally not a policy grant.
 

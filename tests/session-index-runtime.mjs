@@ -38,7 +38,7 @@ const inert = createSessionIndexRuntime({}, {
   },
 });
 assert.equal(Object.isFrozen(inert.service), true);
-assert.deepEqual(Object.keys(inert.service).sort(), ["health", "ready", "restart", "searchBatch", "status"]);
+assert.deepEqual(Object.keys(inert.service).sort(), ["deriveWorkspaceScopeToken", "health", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
 assert.deepEqual(inert.service.status(), {
   enabled: false,
   phase: "disabled",

@@ -19,7 +19,7 @@ npm run daemon:test
 
 The declared benchmarks are `npm run benchmark:session-history` and `npm run benchmark:session-history:scaled`. The package exposes `qq-index-refresh`, `qq-index-history-shadow`, and the safety-checking `qq-session-indexd-launch` supervisor through [`bin/`](bin/qq-session-indexd-launch).
 
-The production session-index service is explicitly opt-in. Its exact plugin contract, bounded configuration, daemon build/user-unit installation, overrides, recovery behavior, and rollback procedure are documented in [`docs/session-index-production.md`](docs/session-index-production.md). The dedicated [`systemd/user/qq-session-indexd.service`](systemd/user/qq-session-indexd.service) does not replace the existing README refresh unit/timer.
+The production session-index daemon is explicitly opt-in. The plugin always injects a frozen `qq-session-index` service with lifecycle/search methods plus the canonical policy-neutral `deriveWorkspaceScopeToken(workspaceId)` and bounded `verifyDshSearchCandidates(options)` helpers. Those two helpers remain usable while the daemon runtime is disabled; disabled `searchBatch` still fails closed. This gives consumers such as qq-core a package-resolution-independent capability boundary, but does not by itself complete qq-core's `/find-session` cutover. The exact seven-method contract, bounded configuration, daemon build/user-unit installation, overrides, recovery behavior, and rollback procedure are documented in [`docs/session-index-production.md`](docs/session-index-production.md). The dedicated [`systemd/user/qq-session-indexd.service`](systemd/user/qq-session-indexd.service) does not replace the existing README refresh unit/timer.
 
 ## Repository map
 

@@ -533,11 +533,13 @@ class DshSessionIndexSource {
  * Exact-read verification for already-authorized search output.
  *
  * This helper never derives or grants access. The caller supplies the permitted
- * event types and surfaces. Missing/stale source events and all read failures are
- * omitted (fail closed), and each (sessionId, seq) coordinate is read once.
+ * event types and surfaces. Missing/stale source events and ordinary read failures
+ * are omitted (fail closed), cancellation rejects the whole operation, and each
+ * (sessionId, seq) coordinate is read once. options.signal is optional.
  */
 export async function verifyDshSearchCandidates(options) {
   plainObject(options, "options");
+  const signal = validateAbortSignal(options.signal);
   plainObject(options.searchResponse, "options.searchResponse");
   plainObject(options.sessionQuery, "options.sessionQuery");
   if (typeof options.sessionQuery.filterEvents !== "function"
@@ -559,16 +561,19 @@ export async function verifyDshSearchCandidates(options) {
       || options.searchResponse.fused.length > 100) {
     throw new TypeError("searchResponse sources/fused arrays exceed search protocol bounds");
   }
+  throwIfAborted(signal);
 
   const allowedTypes = new Set(options.eventTypeAllowList);
   const allowedSurfaces = new Set(options.surfaceAllowList);
   const coordinates = new Map();
   let pointersSeen = 0;
   for (const [sourceOrdinal, source] of options.searchResponse.sources.entries()) {
+    throwIfAborted(signal);
     if (!Array.isArray(source.ranked) || source.ranked.length > 100) {
       throw new TypeError("search source ranked must be an array of at most 100 hits");
     }
     for (const hit of source.ranked) {
+      throwIfAborted(signal);
       if (pointersSeen >= maxCandidates) break;
       plainObject(hit.evidence, "search evidence");
       boundedString(hit.evidence.sessionId, "evidence sessionId", 1, MAX_SESSION_ID_BYTES);
@@ -596,23 +601,43 @@ export async function verifyDshSearchCandidates(options) {
 
   const work = [...coordinates.values()];
   let cursor = 0;
+  let cancellationError = null;
+  throwIfAborted(signal);
   const workers = Array.from({ length: Math.min(maxConcurrency, work.length) }, async () => {
     while (cursor < work.length) {
+      throwIfAborted(signal);
+      if (cancellationError !== null) throw cancellationError;
       const coordinate = work[cursor++];
+      throwIfAborted(signal);
       try {
-        const observation = await readAuthoritativeDocument(options, coordinate);
+        const observation = await readAuthoritativeDocument(options, coordinate, signal);
+        throwIfAborted(signal);
         if (observation === null) continue;
         coordinate.event = observation;
         coordinate.text = observation.text;
-      } catch {
+      } catch (error) {
+        try {
+          throwIfAborted(signal);
+        } catch (abortError) {
+          cancellationError = abortError;
+          throw abortError;
+        }
+        if (isAbortError(error)) {
+          cancellationError = error;
+          throw error;
+        }
         // Stale/missing/unavailable exact reads are deliberately fail-closed.
       }
     }
   });
-  await Promise.all(workers);
+  const workerResults = await Promise.allSettled(workers);
+  throwIfAborted(signal);
+  const rejectedWorker = workerResults.find(({ status }) => status === "rejected");
+  if (rejectedWorker !== undefined) throw rejectedWorker.reason;
 
   const verifiedEvidence = [];
   for (const coordinate of work) {
+    throwIfAborted(signal);
     if (coordinate.event === null) continue;
     const actualType = firstString(
       coordinate.event.eventType,
@@ -623,6 +648,7 @@ export async function verifyDshSearchCandidates(options) {
     const actualSurface = firstString(coordinate.event.surface, coordinate.event.event?.surface);
     if (!allowedTypes.has(actualType) || !allowedSurfaces.has(actualSurface)) continue;
     for (const { queryOrdinal, pointer } of coordinate.pointers) {
+      throwIfAborted(signal);
       if (pointer.eventType !== actualType || pointer.surface !== actualSurface) continue;
       if (!coordinate.text.includes(options.literals[queryOrdinal])) continue;
       verifiedEvidence.push(Object.freeze({
@@ -638,12 +664,14 @@ export async function verifyDshSearchCandidates(options) {
 
   const evidenceBySession = new Map();
   for (const evidence of verifiedEvidence) {
+    throwIfAborted(signal);
     const current = evidenceBySession.get(evidence.sessionId) ?? [];
     current.push(evidence);
     evidenceBySession.set(evidence.sessionId, current);
   }
   const verifiedCandidates = [];
   for (const candidate of options.searchResponse.fused) {
+    throwIfAborted(signal);
     const evidence = evidenceBySession.get(candidate.sessionId);
     if (evidence?.length > 0) {
       verifiedCandidates.push(Object.freeze({
@@ -652,22 +680,27 @@ export async function verifyDshSearchCandidates(options) {
       }));
     }
   }
+  throwIfAborted(signal);
   return Object.freeze({
     verifiedCandidates: Object.freeze(verifiedCandidates),
     verifiedEvidence: Object.freeze(verifiedEvidence),
   });
 }
 
-async function readAuthoritativeDocument(options, coordinate) {
+async function readAuthoritativeDocument(options, coordinate, signal) {
+  throwIfAborted(signal);
   const numericSeq = Number(coordinate.seq);
   if (!Number.isSafeInteger(numericSeq)) return null;
 
   if (typeof options.sessionQuery.filterEvents === "function") {
+    // dsh-session-query rc.7 exposes exactly (sessionId, filters) here. Keep
+    // those positional semantics and enforce cancellation around the read.
     const documents = await options.sessionQuery.filterEvents(coordinate.sessionId, [{
       kind: "seq",
       from: numericSeq,
       to: numericSeq,
     }]);
+    throwIfAborted(signal);
     if (!Array.isArray(documents) || documents.length !== 1) return null;
     const document = documents[0];
     if (document === null || typeof document !== "object" || Array.isArray(document)) return null;
@@ -675,6 +708,7 @@ async function readAuthoritativeDocument(options, coordinate) {
     if (document.sessionId !== undefined && document.sessionId !== coordinate.sessionId) return null;
     if (typeof document.type !== "string" || typeof document.surface !== "string"
         || typeof document.text !== "string") return null;
+    throwIfAborted(signal);
     return document;
   }
 
@@ -683,23 +717,72 @@ async function readAuthoritativeDocument(options, coordinate) {
   // unless the generated target itself explicitly carries a surface.
   let observed;
   try {
-    observed = await options.sessionQuery.readEvent({
+    const request = {
       sessionId: coordinate.sessionId,
       seq: numericSeq,
       before: 0,
       after: 0,
-    });
-  } catch {
-    observed = await options.sessionQuery.readEvent(coordinate.sessionId, coordinate.seq);
+    };
+    observed = signal === undefined
+      ? await options.sessionQuery.readEvent(request)
+      : await options.sessionQuery.readEvent(request, signal);
+    throwIfAborted(signal);
+  } catch (error) {
+    rethrowCancellation(error, signal);
+    // Preserve the existing generated positional fallback without adding an
+    // unsupported third argument.
+    try {
+      throwIfAborted(signal);
+      observed = await options.sessionQuery.readEvent(coordinate.sessionId, coordinate.seq);
+      throwIfAborted(signal);
+    } catch (fallbackError) {
+      rethrowCancellation(fallbackError, signal);
+      throw fallbackError;
+    }
   }
   const event = observed?.target ?? observed;
   if (event === null || typeof event !== "object" || Array.isArray(event)) return null;
   if (event.seq !== undefined && eventSequence(event, "source event") !== BigInt(coordinate.seq)) return null;
+  throwIfAborted(signal);
   const text = typeof event.text === "string"
     ? event.text
     : await options.extractSessionEventText?.(event);
+  throwIfAborted(signal);
   if (typeof text !== "string") return null;
   return { ...event, text };
+}
+
+function validateAbortSignal(signal) {
+  if (signal === undefined) return undefined;
+  if (signal === null
+      || (typeof signal !== "object" && typeof signal !== "function")
+      || typeof signal.aborted !== "boolean"
+      || typeof signal.throwIfAborted !== "function"
+      || typeof signal.addEventListener !== "function"
+      || typeof signal.removeEventListener !== "function") {
+    throw new TypeError("options.signal must be an AbortSignal");
+  }
+  return signal;
+}
+
+function throwIfAborted(signal) {
+  if (signal === undefined || !signal.aborted) return;
+  signal.throwIfAborted();
+  if (signal.reason !== undefined) throw signal.reason;
+  const error = new Error("operation was aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function rethrowCancellation(error, signal) {
+  throwIfAborted(signal);
+  if (isAbortError(error)) throw error;
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError"
+    || error?.code === "ABORT_ERR"
+    || error?.code === "SESSION_QUERY_ABORTED";
 }
 
 function isProductionSessionLog(sessionLog) {
