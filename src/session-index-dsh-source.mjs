@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 export const DSH_SESSION_INDEX_PROJECTION_VERSION = "qq-session-dsh-projection-v1";
 export const DSH_SESSION_INDEX_DEFAULT_BATCH_DOCUMENTS = 256;
@@ -44,9 +45,24 @@ export async function projectDshSessionLog({ sessionId, sessionLog, projectionHe
   plainObject(sessionLog, "sessionLog");
   validateProjectionHelpers(projectionHelpers);
 
-  const builtRecords = await projectionHelpers.buildSessionEventRecords(sessionLog);
+  const productionShape = isProductionSessionLog(sessionLog);
+  if (productionShape && sessionLog.session.id !== sessionId) {
+    throw new TypeError("session log header id does not match sessionId");
+  }
+  const workspaceId = productionShape
+    ? usableProductionWorkspace(sessionLog.session.cwd)
+    : usableGeneratedWorkspace(sessionLog);
+  // A session without a policy-neutral workspace identity must never enter the
+  // global derived index. This is a skip, not a source-wide failure.
+  if (workspaceId === null) return [];
+
+  const builtRecords = productionShape
+    ? await projectionHelpers.buildSessionEventRecords(sessionId, sessionLog.events)
+    : await projectionHelpers.buildSessionEventRecords(sessionLog);
   const records = arrayResult(builtRecords, "records", "buildSessionEventRecords");
-  const builtDocuments = await projectionHelpers.buildSessionEventSearchDocuments(records, sessionLog);
+  const builtDocuments = productionShape
+    ? await projectionHelpers.buildSessionEventSearchDocuments(sessionId, sessionLog.events)
+    : await projectionHelpers.buildSessionEventSearchDocuments(records, sessionLog);
   const semanticDocuments = arrayResult(
     builtDocuments,
     "documents",
@@ -82,15 +98,6 @@ export async function projectDshSessionLog({ sessionId, sessionLog, projectionHe
     const name = `raw records[${index}]`;
     const seq = BigInt(index);
     const semantic = semanticBySeq.get(seq.toString());
-    const workspaceId = firstString(
-      record.workspaceId,
-      record.workspace?.id,
-      record.event?.workspaceId,
-      sessionLog.workspaceId,
-      sessionLog.workspace?.id,
-      sessionLog.header?.workspaceId,
-    );
-    boundedString(workspaceId, `${name}.workspaceId`, 1, MAX_WORKSPACE_ID_BYTES);
     const eventType = firstString(record.eventType, record.event?.eventType, record.event?.type, record.type);
     boundedString(eventType, `${name}.eventType`, 1, MAX_EVENT_TYPE_BYTES);
     const surface = firstString(record.surface, record.event?.surface);
@@ -99,10 +106,14 @@ export async function projectDshSessionLog({ sessionId, sessionLog, projectionHe
 
     let body = "";
     if (semantic !== undefined) {
-      const extracted = await projectionHelpers.extractSessionEventText(semantic, record);
+      // rc.7 semantic documents already own the authoritative projection text.
+      // The helper remains only for generated pre-rc compatibility.
+      const extracted = typeof semantic.text === "string"
+        ? semantic.text
+        : await projectionHelpers.extractSessionEventText(semantic, record);
       if (extracted !== null && extracted !== undefined) {
         if (typeof extracted !== "string") {
-          throw new TypeError("extractSessionEventText must return a string, null, or undefined");
+          throw new TypeError("semantic text projection must be a string, null, or undefined");
         }
         body = extracted;
       }
@@ -268,6 +279,17 @@ class DshSessionIndexSource {
     if (this.#closed) throw new Error("DSH session-index source is closed");
     if (!this.#started || this.#paused) return this.start();
     return this.#enqueue(() => this.#runCorpusSync());
+  }
+
+  /** Probe the dedicated writer connection without rescanning the corpus. */
+  async health(options = {}) {
+    if (this.#closed || this.#paused || this.#state.phase !== "live") {
+      throw new Error("DSH session-index source is not live");
+    }
+    if (typeof this.#client?.health !== "function") {
+      throw new Error("DSH session-index source client has no health capability");
+    }
+    return this.#client.health(options);
   }
 
   async pause() {
@@ -518,8 +540,13 @@ export async function verifyDshSearchCandidates(options) {
   plainObject(options, "options");
   plainObject(options.searchResponse, "options.searchResponse");
   plainObject(options.sessionQuery, "options.sessionQuery");
-  callable(options.sessionQuery.readEvent, "options.sessionQuery.readEvent");
-  callable(options.extractSessionEventText, "options.extractSessionEventText");
+  if (typeof options.sessionQuery.filterEvents !== "function"
+      && typeof options.sessionQuery.readEvent !== "function") {
+    throw new TypeError("sessionQuery must provide filterEvents or readEvent");
+  }
+  if (options.extractSessionEventText !== undefined) {
+    callable(options.extractSessionEventText, "options.extractSessionEventText");
+  }
   stringArray(options.literals, "options.literals", 1, 5, 500);
   stringArray(options.eventTypeAllowList, "options.eventTypeAllowList", 1, 32, MAX_EVENT_TYPE_BYTES);
   stringArray(options.surfaceAllowList, "options.surfaceAllowList", 1, 32, MAX_SURFACE_BYTES);
@@ -573,13 +600,10 @@ export async function verifyDshSearchCandidates(options) {
     while (cursor < work.length) {
       const coordinate = work[cursor++];
       try {
-        const event = await options.sessionQuery.readEvent(coordinate.sessionId, coordinate.seq);
-        if (event === null || event === undefined) continue;
-        plainObject(event, "source event");
-        const text = await options.extractSessionEventText(event);
-        if (typeof text !== "string") continue;
-        coordinate.event = event;
-        coordinate.text = text;
+        const observation = await readAuthoritativeDocument(options, coordinate);
+        if (observation === null) continue;
+        coordinate.event = observation;
+        coordinate.text = observation.text;
       } catch {
         // Stale/missing/unavailable exact reads are deliberately fail-closed.
       }
@@ -634,6 +658,74 @@ export async function verifyDshSearchCandidates(options) {
   });
 }
 
+async function readAuthoritativeDocument(options, coordinate) {
+  const numericSeq = Number(coordinate.seq);
+  if (!Number.isSafeInteger(numericSeq)) return null;
+
+  if (typeof options.sessionQuery.filterEvents === "function") {
+    const documents = await options.sessionQuery.filterEvents(coordinate.sessionId, [{
+      kind: "seq",
+      from: numericSeq,
+      to: numericSeq,
+    }]);
+    if (!Array.isArray(documents) || documents.length !== 1) return null;
+    const document = documents[0];
+    if (document === null || typeof document !== "object" || Array.isArray(document)) return null;
+    if (eventSequence(document, "filtered event") !== BigInt(coordinate.seq)) return null;
+    if (document.sessionId !== undefined && document.sessionId !== coordinate.sessionId) return null;
+    if (typeof document.type !== "string" || typeof document.surface !== "string"
+        || typeof document.text !== "string") return null;
+    return document;
+  }
+
+  // Generated compatibility only. Production readEvent returns a window whose
+  // raw target has no authoritative surface, so such a target fails closed
+  // unless the generated target itself explicitly carries a surface.
+  let observed;
+  try {
+    observed = await options.sessionQuery.readEvent({
+      sessionId: coordinate.sessionId,
+      seq: numericSeq,
+      before: 0,
+      after: 0,
+    });
+  } catch {
+    observed = await options.sessionQuery.readEvent(coordinate.sessionId, coordinate.seq);
+  }
+  const event = observed?.target ?? observed;
+  if (event === null || typeof event !== "object" || Array.isArray(event)) return null;
+  if (event.seq !== undefined && eventSequence(event, "source event") !== BigInt(coordinate.seq)) return null;
+  const text = typeof event.text === "string"
+    ? event.text
+    : await options.extractSessionEventText?.(event);
+  if (typeof text !== "string") return null;
+  return { ...event, text };
+}
+
+function isProductionSessionLog(sessionLog) {
+  return sessionLog.session !== null
+    && typeof sessionLog.session === "object"
+    && !Array.isArray(sessionLog.session)
+    && Array.isArray(sessionLog.events);
+}
+
+function usableProductionWorkspace(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0 || cwd.includes("\0") || !isAbsolute(cwd)) return null;
+  boundedString(cwd, "session.cwd", 1, MAX_WORKSPACE_ID_BYTES);
+  return cwd;
+}
+
+function usableGeneratedWorkspace(sessionLog) {
+  const workspaceId = firstString(
+    sessionLog.workspaceId,
+    sessionLog.workspace?.id,
+    sessionLog.header?.workspaceId,
+  );
+  if (workspaceId === undefined || workspaceId.length === 0) return null;
+  boundedString(workspaceId, "session workspaceId", 1, MAX_WORKSPACE_ID_BYTES);
+  return workspaceId;
+}
+
 function validateProjectionHelpers(helpers) {
   plainObject(helpers, "projectionHelpers");
   callable(helpers.buildSessionEventRecords, "buildSessionEventRecords");
@@ -682,7 +774,7 @@ async function normalizeSessionList(listed, maximum) {
   for (const [index, value] of values.entries()) {
     const sessionId = typeof value === "string"
       ? value
-      : firstString(value?.sessionId, value?.id);
+      : firstString(value?.header?.id, value?.sessionId, value?.id);
     boundedString(sessionId, `listed sessions[${index}]`, 1, MAX_SESSION_ID_BYTES);
     if (unique.has(sessionId)) throw new TypeError("listed sessions must not contain duplicates");
     unique.add(sessionId);
@@ -704,6 +796,7 @@ function eventSequence(value, name) {
 function eventTime(record, name) {
   const raw = record.eventTimeUnixMs
     ?? record.timeUnixMs
+    ?? record.time
     ?? record.event?.eventTimeUnixMs
     ?? record.event?.timeUnixMs
     ?? record.timestamp

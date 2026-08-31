@@ -1,0 +1,24 @@
+[Unit]
+Description=QQ durable session-history index daemon
+Documentation=file:%h/projects/qq-index/docs/session-index-production.md
+After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+UMask=0077
+RuntimeDirectory=qq-index
+RuntimeDirectoryMode=0700
+StateDirectory=qq-index
+StateDirectoryMode=0700
+ExecStart=%h/projects/qq-index/bin/qq-session-indexd-launch
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
