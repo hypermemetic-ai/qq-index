@@ -462,6 +462,26 @@ class DshSessionIndexSource {
 
   async #syncSession(sessionId, durableState) {
     const sessionLog = await this.#sessionQuery.readSession(sessionId);
+    const durableProduction = inspectDurableProductionSnapshot(sessionId, sessionLog, durableState);
+    if (durableProduction !== null) {
+      if (durableProduction.nextSeq > durableProduction.eventCount) {
+        incrementCounter(this.#state, "sessionsScanned", 1);
+        throw new Error("source log is shorter than its durable session cursor");
+      }
+      if (durableProduction.nextSeq === durableProduction.eventCount) {
+        if (durableProduction.workspaceId !== durableProduction.durableWorkspaceId
+            || durableProduction.workspaceScopeToken !== durableProduction.durableWorkspaceScopeToken) {
+          incrementCounter(this.#state, "sessionsScanned", 1);
+          throw new Error("source workspace does not match its durable session cursor");
+        }
+        // readSession is the authoritative, replay-validated production snapshot.
+        // An exact durable cursor/workspace match proves there is no suffix to
+        // project or commit. Count the completed read exactly as the full path does.
+        incrementCounter(this.#state, "sessionsScanned", 1);
+        return;
+      }
+    }
+
     const documents = await projectDshSessionLog({
       sessionId,
       sessionLog,
@@ -1264,6 +1284,62 @@ function isAbortError(error) {
   return error?.name === "AbortError"
     || error?.code === "ABORT_ERR"
     || error?.code === "SESSION_QUERY_ABORTED";
+}
+
+/**
+ * Recognize only the concrete, replay-validated production snapshot and durable
+ * state contracts. Returning null deliberately delegates every unverifiable or
+ * compatibility shape to projectDshSessionLog and its existing validation.
+ */
+function inspectDurableProductionSnapshot(sessionId, sessionLog, durableState) {
+  if (durableState === undefined) return null;
+  try {
+    exactRecord(sessionLog, ["session", "events"], [], "production session log");
+    if (!Array.isArray(sessionLog.events)
+        || Object.getPrototypeOf(sessionLog.events) !== Array.prototype
+        || !Number.isSafeInteger(sessionLog.events.length)
+        || sessionLog.events.length < 0) return null;
+
+    exactRecord(
+      sessionLog.session,
+      ["version", "id", "createdAt", "cwd"],
+      ["parentSession", "seedLength", "origin", "delegationDepth", "agentPreset"],
+      "production session header",
+    );
+    validateSnapshotHeader(sessionLog.session, sessionId, "production session header");
+    const workspaceId = usableProductionWorkspace(sessionLog.session.cwd);
+    if (workspaceId === null) return null;
+
+    exactRecord(
+      durableState,
+      ["sessionId", "nextSeq", "workspaceId", "headerRevision"],
+      [],
+      "durable production state",
+    );
+    boundedString(durableState.sessionId, "durable production state.sessionId", 1, MAX_SESSION_ID_BYTES);
+    if (durableState.sessionId !== sessionId || typeof durableState.nextSeq !== "string") return null;
+    const nextSeq = parseUnsigned(durableState.nextSeq, "durable nextSeq");
+    boundedString(
+      durableState.workspaceId,
+      "durable production state.workspaceId",
+      1,
+      MAX_WORKSPACE_ID_BYTES,
+    );
+    boundedString(durableState.headerRevision, "durable production state.headerRevision", 1, 256);
+
+    const eventCount = BigInt(sessionLog.events.length);
+    if (eventCount > MAX_SQLITE_INTEGER) return null;
+    return {
+      nextSeq,
+      eventCount,
+      workspaceId,
+      durableWorkspaceId: durableState.workspaceId,
+      workspaceScopeToken: deriveWorkspaceScopeToken(workspaceId),
+      durableWorkspaceScopeToken: deriveWorkspaceScopeToken(durableState.workspaceId),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function isProductionSessionLog(sessionLog) {
