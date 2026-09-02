@@ -3,6 +3,11 @@ use qq_session_index_core::{
     RrfContributionV1, SCHEMA_FINGERPRINT, SCHEMA_VERSION, SEARCH_BATCH_RESPONSE_VERSION_V1,
     SEARCH_BATCH_VERSION_V1, SearchBatchResponseV1, SearchBatchV1, SearchFiltersV1, SearchSourceV1,
     SessionSeqBoundV1, SourceStateV1, SourceTruncationReasonV1, VerificationPointerV1,
+    view_platform::{
+        ViewAuthorityV1, ViewDescriptionV1, ViewError, ViewFreshnessV1, ViewIdentityV1,
+        ViewLifecycleV1, ViewMutationV1, ViewOperationReceiptV1, ViewPartitionStatesV1,
+        ViewQueryResponseV1, ViewSourceCheckpointV1, ViewTelemetryV1,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,6 +22,7 @@ pub const SOURCE_STATE_VERSION_V1: &str = "source-state-v1";
 pub const SOURCE_STATE_RESPONSE_VERSION_V1: &str = "source-state-response-v1";
 pub const CANCEL_VERSION_V1: &str = "cancel-v1";
 pub const CANCEL_RESPONSE_VERSION_V1: &str = "cancel-response-v1";
+pub const VIEW_DESCRIBE_RESPONSE_VERSION_V1: &str = "qq-index-view-describe-response/v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_WIRE_DOCUMENTS: usize = 1024;
@@ -62,7 +68,101 @@ pub(crate) enum WireOperation {
         #[serde(default)]
         minimum_source_watermark: Option<String>,
     },
+    DescribeViews {
+        version: String,
+    },
+    ViewPartitionState {
+        version: String,
+        view: ViewIdentityV1,
+        partition_keys: Vec<String>,
+    },
+    MutateView {
+        version: String,
+        mutation: WireViewMutation,
+    },
+    SetViewLifecycle {
+        version: String,
+        view: ViewIdentityV1,
+        state: WireViewLifecycleState,
+        source_fence: String,
+        lag_ms: u64,
+    },
+    Execute {
+        version: String,
+        view: ViewIdentityV1,
+        access: String,
+        params: Value,
+        authority: ViewAuthorityV1,
+        freshness: ViewFreshnessV1,
+    },
     Shutdown,
+}
+
+impl WireOperation {
+    pub(crate) fn telemetry_name(&self) -> Option<&'static str> {
+        match self {
+            Self::DescribeViews { .. } => Some("describe-views"),
+            Self::ViewPartitionState { .. } => Some("partition-state"),
+            Self::MutateView { mutation, .. } => Some(match mutation {
+                WireViewMutation::ReplacePartition { .. } => "replace-partition",
+                WireViewMutation::ApplyDelta { .. } => "apply-delta",
+                WireViewMutation::DeletePartition { .. } => "delete-partition",
+            }),
+            Self::SetViewLifecycle { .. } => Some("set-view-lifecycle"),
+            Self::Execute { .. } => Some("execute"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum WireViewMutation {
+    ReplacePartition {
+        view: ViewIdentityV1,
+        partition_key: String,
+        source: WireViewSourceCheckpoint,
+        rows: Vec<Value>,
+    },
+    ApplyDelta {
+        view: ViewIdentityV1,
+        partition_key: String,
+        expected_cursor: String,
+        source: WireViewSourceCheckpoint,
+        upserts: Vec<Value>,
+        deletes: Vec<String>,
+    },
+    DeletePartition {
+        view: ViewIdentityV1,
+        partition_key: String,
+        expected_cursor: String,
+        source_identity: String,
+        source_fence: String,
+        lag_ms: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WireViewSourceCheckpoint {
+    source_identity: String,
+    durable_revision: String,
+    next_cursor: String,
+    source_fence: String,
+    lag_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WireViewLifecycleState {
+    Ready,
+    Building,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -148,6 +248,8 @@ pub(crate) enum ProtocolError {
     Forbidden,
     #[error(transparent)]
     Core(#[from] IndexError),
+    #[error(transparent)]
+    View(#[from] ViewError),
 }
 
 impl ProtocolError {
@@ -172,6 +274,20 @@ impl ProtocolError {
                 | IndexError::WorkspaceConflict { .. } => "mutation_conflict",
                 _ => "storage_error",
             },
+            Self::View(error) => match error {
+                ViewError::UnsupportedView { .. } => "unsupported_view",
+                ViewError::UnsupportedAccess { .. } => "unsupported_access",
+                ViewError::ViewBuilding { .. } => "view_building",
+                ViewError::ViewFailed { .. } => "view_failed",
+                ViewError::FreshnessUnavailable { .. } => "freshness_unavailable",
+                ViewError::AuthorizationRequired => "authorization_required",
+                ViewError::CursorConflict { .. } | ViewError::SourceIdentityConflict => {
+                    "mutation_conflict"
+                }
+                ViewError::InvalidMutation(_) | ViewError::InvalidQuery(_) => "invalid_request",
+                ViewError::Interrupted => "cancelled",
+                _ => "storage_error",
+            },
         }
     }
 
@@ -184,6 +300,9 @@ impl ProtocolError {
                 | Self::StorageUnavailable
                 | Self::Core(IndexError::SourceWatermarkUnavailable { .. })
                 | Self::Core(IndexError::Sqlite(_))
+                | Self::View(ViewError::FreshnessUnavailable { .. })
+                | Self::View(ViewError::ViewBuilding { .. })
+                | Self::View(ViewError::Sqlite(_))
         )
     }
 }
@@ -221,6 +340,21 @@ fn validate_operation_keys(frame: &[u8], operation: &WireOperation) -> Result<()
         .ok_or_else(|| ProtocolError::Malformed("operation must be an object".to_owned()))?;
     let allowed: &[&str] = match operation {
         WireOperation::Health | WireOperation::Shutdown => &["type"],
+        WireOperation::DescribeViews { .. } => &["type", "version"],
+        WireOperation::ViewPartitionState { .. } => &["type", "version", "view", "partitionKeys"],
+        WireOperation::MutateView { .. } => &["type", "version", "mutation"],
+        WireOperation::SetViewLifecycle { .. } => {
+            &["type", "version", "view", "state", "sourceFence", "lagMs"]
+        }
+        WireOperation::Execute { .. } => &[
+            "type",
+            "version",
+            "view",
+            "access",
+            "params",
+            "authority",
+            "freshness",
+        ],
         WireOperation::Cancel { .. } => &["type", "version", "targetRequestId", "reason"],
         WireOperation::SourceState { .. } => &["type", "version", "sessionIds"],
         WireOperation::ApplyBatch { .. } => &["type", "version", "batch"],
@@ -452,6 +586,166 @@ pub(crate) fn cancel_response(
         "targetRequestId": target_request_id,
         "state": state,
         "cancellationRequested": cancellation_requested,
+    })
+}
+
+pub(crate) fn into_core_view_mutation(
+    mutation: WireViewMutation,
+) -> Result<ViewMutationV1, ProtocolError> {
+    Ok(match mutation {
+        WireViewMutation::ReplacePartition {
+            view,
+            partition_key,
+            source,
+            rows,
+        } => ViewMutationV1::ReplacePartition {
+            view,
+            partition_key,
+            source: source.into_core()?,
+            rows,
+        },
+        WireViewMutation::ApplyDelta {
+            view,
+            partition_key,
+            expected_cursor,
+            source,
+            upserts,
+            deletes,
+        } => ViewMutationV1::ApplyDelta {
+            view,
+            partition_key,
+            expected_cursor: parse_u64("expectedCursor", &expected_cursor)?,
+            source: source.into_core()?,
+            upserts,
+            deletes,
+        },
+        WireViewMutation::DeletePartition {
+            view,
+            partition_key,
+            expected_cursor,
+            source_identity,
+            source_fence,
+            lag_ms,
+        } => ViewMutationV1::DeletePartition {
+            view,
+            partition_key,
+            expected_cursor: parse_u64("expectedCursor", &expected_cursor)?,
+            source_identity,
+            source_fence,
+            lag_ms,
+        },
+    })
+}
+
+impl WireViewSourceCheckpoint {
+    fn into_core(self) -> Result<ViewSourceCheckpointV1, ProtocolError> {
+        Ok(ViewSourceCheckpointV1 {
+            source_identity: self.source_identity,
+            durable_revision: self.durable_revision,
+            next_cursor: parse_u64("nextCursor", &self.next_cursor)?,
+            source_fence: self.source_fence,
+            lag_ms: self.lag_ms,
+        })
+    }
+}
+
+pub(crate) fn into_core_view_lifecycle(
+    view: ViewIdentityV1,
+    state: WireViewLifecycleState,
+    source_fence: String,
+    lag_ms: u64,
+) -> ViewLifecycleV1 {
+    match state {
+        WireViewLifecycleState::Ready => ViewLifecycleV1::Activate {
+            view,
+            source_fence,
+            lag_ms,
+        },
+        WireViewLifecycleState::Building => ViewLifecycleV1::MarkBuilding {
+            view,
+            source_fence,
+            lag_ms,
+        },
+        WireViewLifecycleState::Failed => ViewLifecycleV1::MarkFailed {
+            view,
+            source_fence,
+            lag_ms,
+        },
+    }
+}
+
+pub(crate) fn describe_views_response(views: &[ViewDescriptionV1]) -> Value {
+    json!({
+        "type": "describeViews",
+        "version": VIEW_DESCRIBE_RESPONSE_VERSION_V1,
+        "views": views.iter().map(|view| json!({
+            "manifest": view.manifest,
+            "state": view.state,
+            "snapshot": snapshot_value(&view.snapshot),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn view_partition_state_response(state: &ViewPartitionStatesV1) -> Value {
+    json!({
+        "type": "viewPartitionState",
+        "version": qq_session_index_core::view_platform::VIEW_PARTITION_STATE_VERSION_V1,
+        "view": state.view,
+        "buildId": state.build_id,
+        "snapshot": snapshot_value(&state.snapshot),
+        "partitions": state.partitions.iter().map(|partition| json!({
+            "partitionKey": partition.partition_key,
+            "sourceIdentity": partition.source_identity,
+            "durableRevision": partition.durable_revision,
+            "nextCursor": partition.next_cursor.to_string(),
+            "generation": partition.generation.to_string(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn view_receipt_response(receipt: &ViewOperationReceiptV1) -> Value {
+    json!({
+        "type": "mutateView",
+        "version": receipt.version,
+        "view": receipt.view,
+        "buildId": receipt.build_id,
+        "state": receipt.state,
+        "snapshot": snapshot_value(&receipt.snapshot),
+        "partitionKey": receipt.partition_key,
+        "nextCursor": receipt.next_cursor.map(|value| value.to_string()),
+        "affectedRows": receipt.affected_rows,
+        "telemetry": telemetry_value(&receipt.telemetry),
+    })
+}
+
+pub(crate) fn view_query_response(response: &ViewQueryResponseV1) -> Value {
+    json!({
+        "type": "execute",
+        "version": response.version,
+        "view": response.view,
+        "buildId": response.build_id,
+        "access": response.access,
+        "snapshot": snapshot_value(&response.snapshot),
+        "result": response.result,
+        "telemetry": telemetry_value(&response.telemetry),
+    })
+}
+
+fn snapshot_value(snapshot: &qq_session_index_core::view_platform::ViewSnapshotV1) -> Value {
+    json!({
+        "generation": snapshot.generation.to_string(),
+        "sourceFence": snapshot.source_fence,
+        "lagMs": snapshot.lag_ms.to_string(),
+    })
+}
+
+fn telemetry_value(telemetry: &ViewTelemetryV1) -> Value {
+    json!({
+        "operation": telemetry.operation,
+        "outcome": telemetry.outcome,
+        "elapsedMicros": telemetry.elapsed_micros.to_string(),
+        "phasesMicros": telemetry.phases_micros.iter().map(|(key, value)| (key.clone(), Value::String(value.to_string()))).collect::<serde_json::Map<_, _>>(),
+        "counts": telemetry.counts.iter().map(|(key, value)| (key.clone(), Value::String(value.to_string()))).collect::<serde_json::Map<_, _>>(),
     })
 }
 

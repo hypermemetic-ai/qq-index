@@ -288,6 +288,66 @@ try {
   assert.equal(health.cancelRequestVersion, "cancel-v1");
   assert.equal(health.cancelResponseVersion, "cancel-response-v1");
 
+  const describedViews = await firstClient.describeViews({ timeoutMs: 1_000 });
+  assert.equal(describedViews.views.length, 2);
+  assert.equal(describedViews.views.some(({ manifest }) => manifest.id === "qq.session.conversation"), true);
+  const viewToken = "waaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const viewIdentity = { id: "qq.session.conversation", version: 1 };
+  const viewReceipt = await firstClient.mutateView({
+    kind: "replacePartition",
+    view: viewIdentity,
+    partitionKey: "node-view-session",
+    source: {
+      sourceIdentity: "node-view-lifecycle",
+      durableRevision: "node-view-revision-1",
+      nextCursor: "1",
+      sourceFence: "node-view-fence-1",
+      lagMs: 0,
+    },
+    rows: [{
+      rowKey: "node-view-session:0",
+      sessionId: "node-view-session",
+      seq: 0,
+      eventTimeUnixMs: 1_700_000_000_000,
+      eventType: "message/generated",
+      surface: "current",
+      workspaceScopeToken: viewToken,
+      body: "generated node view literal",
+      fingerprint: "node-view-fingerprint-1",
+      sessionTitle: "Node view title",
+      sessionUpdatedAtUnixMs: 1_700_000_000_001,
+    }],
+  }, { timeoutMs: 1_000 });
+  assert.equal(viewReceipt.nextCursor, "1");
+  assert.equal(viewReceipt.telemetry.counts.affectedRows, "1");
+  const partitionState = await firstClient.viewPartitionState({
+    view: viewIdentity,
+    partitionKeys: ["missing-view-session", "node-view-session"],
+  });
+  assert.equal(partitionState.partitions.length, 1);
+  assert.equal(partitionState.partitions[0].partitionKey, "node-view-session");
+  assert.equal(partitionState.partitions[0].durableRevision, "node-view-revision-1");
+  assert.equal(partitionState.partitions[0].nextCursor, "1");
+  const viewQuery = {
+    version: "qq-index-query/v1",
+    view: viewIdentity,
+    access: "literal-session-search",
+    params: { literals: ["node view"], limit: 5 },
+    authority: { kind: "workspace-token-set/v1", scopeTokens: [viewToken] },
+    freshness: { mode: "caught-up", maxLagMs: 0 },
+  };
+  await assert.rejects(firstClient.execute(viewQuery), (error) => error.code === "view_building");
+  await firstClient.setViewLifecycle({
+    view: viewIdentity,
+    state: "ready",
+    sourceFence: "node-view-live",
+    lagMs: 0,
+  });
+  const viewResult = await firstClient.execute(viewQuery);
+  assert.equal(viewResult.result.sessions[0].sessionId, "node-view-session");
+  assert.equal(viewResult.telemetry.counts.results, "1");
+  assert.equal(JSON.stringify(viewResult.telemetry).includes("node view"), false);
+
   const socketMetadata = await stat(socketPath);
   assert.equal(socketMetadata.isSocket(), true);
   assert.equal(socketMetadata.mode & 0o777, 0o600);

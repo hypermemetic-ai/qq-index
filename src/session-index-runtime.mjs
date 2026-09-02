@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 
 import { connectSessionIndexClient } from "./session-index-client.mjs";
+import { compiledViewCapabilities, compiledViewRegistry } from "./views/catalog.mjs";
 import {
   createDshSessionIndexSource,
   deriveWorkspaceScopeToken,
@@ -166,6 +167,8 @@ class SessionIndexRuntime {
       ready: () => this.ready(),
       health: (options) => this.health(options),
       searchBatch: (request, options) => this.searchBatch(request, options),
+      capabilities: () => compiledViewCapabilities,
+      queryView: (request, options) => this.queryView(request, options),
       restart: () => this.restart(),
       deriveWorkspaceScopeToken,
       verifyDshSearchCandidates,
@@ -253,6 +256,28 @@ class SessionIndexRuntime {
       // monitor failure or disposal must not send a search through stale readiness.
       this.#requireEnabledAndBound(true);
       return await client.searchBatch(request, operationOptions(detached, this.#config.requestTimeoutMs));
+    } catch (error) {
+      if (isOutage(error)) this.#markOutage(error);
+      throw error;
+    } finally {
+      await this.#closeTrackedClient(client);
+    }
+  }
+
+  async queryView(request, options = {}) {
+    this.#requireEnabledForViewQuery();
+    const detached = validateOperationOptions(options);
+    const prepared = compiledViewRegistry.prepareQuery(request, { deriveWorkspaceScopeToken });
+    const client = await this.#openShortLivedClient(detached);
+    try {
+      // No DSH/session source object is consulted here. View lifecycle, freshness,
+      // authorization intersection, ranking, and assembly are daemon-local.
+      this.#requireEnabledForViewQuery();
+      const response = await client.execute(
+        prepared,
+        operationOptions(detached, this.#config.requestTimeoutMs),
+      );
+      return compiledViewRegistry.validateResult(request, response);
     } catch (error) {
       if (isOutage(error)) this.#markOutage(error);
       throw error;
@@ -481,6 +506,11 @@ class SessionIndexRuntime {
   #assertBinding(binding) {
     if (this.#disposed) throw unavailable("disposing");
     if (this.#binding !== binding) throw unavailable("binding_replaced");
+  }
+
+  #requireEnabledForViewQuery() {
+    if (!this.#config.enabled) throw unavailable("disabled");
+    if (this.#disposed || this.#phase === "disposing") throw unavailable("disposing");
   }
 
   #requireEnabledAndBound(requireReady) {

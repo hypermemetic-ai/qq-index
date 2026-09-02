@@ -8,18 +8,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use qq_session_index_core::SessionIndex;
+use qq_session_index_core::{
+    SessionIndex,
+    view_platform::{ViewCatalog, ViewQueryV1},
+};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::protocol::{
     CANCEL_VERSION_V1, MAX_FRAME_BYTES, MUTATION_BATCH_VERSION, ProtocolError, RequestEnvelope,
-    SOURCE_STATE_VERSION_V1, WireCancelReason, WireOperation, cancel_response, error_envelope,
-    health_response, into_core_search, parse_request, receipt_response, require_operation_version,
-    require_protocol_version, search_response, shutdown_response, source_state_response,
-    success_envelope,
+    SOURCE_STATE_VERSION_V1, WireCancelReason, WireOperation, cancel_response,
+    describe_views_response, error_envelope, health_response, into_core_search,
+    into_core_view_lifecycle, into_core_view_mutation, parse_request, receipt_response,
+    require_operation_version, require_protocol_version, search_response, shutdown_response,
+    source_state_response, success_envelope, view_partition_state_response, view_query_response,
+    view_receipt_response,
 };
 use crate::runtime::{CancelReason, Coordinator, Runtime, now_unix_ms};
 
@@ -59,6 +64,8 @@ pub enum ServerError {
     },
     #[error(transparent)]
     Index(#[from] qq_session_index_core::IndexError),
+    #[error(transparent)]
+    View(#[from] qq_session_index_core::view_platform::ViewError),
 }
 
 impl ServerError {
@@ -116,6 +123,10 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
         DatabaseMode::Create => SessionIndex::create(&config.database_path)?,
         DatabaseMode::Open => SessionIndex::open(&config.database_path)?,
     };
+    let view_catalog = match config.database_mode {
+        DatabaseMode::Create => ViewCatalog::create(&config.database_path)?,
+        DatabaseMode::Open => ViewCatalog::open_or_create(&config.database_path)?,
+    };
     let runtime = Runtime::start(
         writer,
         &config.database_path,
@@ -123,6 +134,9 @@ pub fn run(config: &ServerConfig) -> Result<(), ServerError> {
         config.queue_capacity,
     )?;
     let coordinator = runtime.coordinator();
+    coordinator
+        .install_view_catalog(view_catalog)
+        .map_err(|error| ServerError::InvalidConfig(error.to_string()))?;
 
     listener.set_nonblocking(true).map_err(|error| {
         ServerError::io("setting nonblocking mode on", &config.socket_path, error)
@@ -393,6 +407,20 @@ fn dispatch(
     coordinator: &Coordinator,
     owner_is_peer: bool,
 ) -> Result<(Value, bool), ProtocolError> {
+    let telemetry_name = request.operation.telemetry_name();
+    let started = Instant::now();
+    let result = dispatch_inner(request, coordinator, owner_is_peer);
+    if let Some(operation) = telemetry_name {
+        log_view_telemetry(operation, started, &result);
+    }
+    result
+}
+
+fn dispatch_inner(
+    request: RequestEnvelope,
+    coordinator: &Coordinator,
+    owner_is_peer: bool,
+) -> Result<(Value, bool), ProtocolError> {
     require_protocol_version(&request.protocol_version)?;
     check_deadline(request.deadline_unix_ms)?;
 
@@ -464,6 +492,80 @@ fn dispatch(
             )?;
             (search_response(&response), false)
         }
+        WireOperation::DescribeViews { version } => {
+            require_operation_version(
+                &version,
+                qq_session_index_core::view_platform::VIEW_DESCRIBE_VERSION_V1,
+            )?;
+            let views = coordinator.describe_views(request.deadline_unix_ms)?;
+            (describe_views_response(&views), false)
+        }
+        WireOperation::ViewPartitionState {
+            version,
+            view,
+            partition_keys,
+        } => {
+            require_operation_version(
+                &version,
+                qq_session_index_core::view_platform::VIEW_PARTITION_STATE_VERSION_V1,
+            )?;
+            let state = coordinator.view_partition_states(
+                request.deadline_unix_ms,
+                &view,
+                &partition_keys,
+            )?;
+            (view_partition_state_response(&state), false)
+        }
+        WireOperation::MutateView { version, mutation } => {
+            require_operation_version(
+                &version,
+                qq_session_index_core::view_platform::VIEW_MUTATION_VERSION_V1,
+            )?;
+            let mutation = into_core_view_mutation(mutation)?;
+            let receipt = coordinator.mutate_view(request.deadline_unix_ms, &mutation)?;
+            (view_receipt_response(&receipt), false)
+        }
+        WireOperation::SetViewLifecycle {
+            version,
+            view,
+            state,
+            source_fence,
+            lag_ms,
+        } => {
+            require_operation_version(
+                &version,
+                qq_session_index_core::view_platform::VIEW_LIFECYCLE_VERSION_V1,
+            )?;
+            let lifecycle = into_core_view_lifecycle(view, state, source_fence, lag_ms);
+            let receipt = coordinator.set_view_lifecycle(request.deadline_unix_ms, &lifecycle)?;
+            (view_receipt_response(&receipt), false)
+        }
+        WireOperation::Execute {
+            version,
+            view,
+            access,
+            params,
+            authority,
+            freshness,
+        } => {
+            require_operation_version(
+                &version,
+                qq_session_index_core::view_platform::VIEW_QUERY_VERSION_V1,
+            )?;
+            let query = ViewQueryV1 {
+                view,
+                access,
+                params,
+                authority,
+                freshness,
+            };
+            let response = coordinator.query_view(
+                request.request_id.clone(),
+                request.deadline_unix_ms,
+                &query,
+            )?;
+            (view_query_response(&response), false)
+        }
         WireOperation::Shutdown => {
             if !owner_is_peer {
                 return Err(ProtocolError::Forbidden);
@@ -472,10 +574,62 @@ fn dispatch(
         }
     };
 
-    // Queue time and core execution both count. There is deliberately no claim of
-    // active SQLite interruption in this serialized first slice.
+    // Queue time and core execution both count. A controlled view query publishes its
+    // matching SQLite interrupt handle only while it owns the per-view connection mutex.
     check_deadline(request.deadline_unix_ms)?;
     Ok((response, should_shutdown))
+}
+
+fn log_view_telemetry(
+    operation: &str,
+    started: Instant,
+    result: &Result<(Value, bool), ProtocolError>,
+) {
+    let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let record = view_telemetry_record(operation, elapsed, result);
+    let _ = writeln!(io::stderr().lock(), "{record}");
+}
+
+fn view_telemetry_record(
+    operation: &str,
+    elapsed_micros: u64,
+    result: &Result<(Value, bool), ProtocolError>,
+) -> Value {
+    match result {
+        Ok((response, _)) => {
+            let details = response.get("telemetry").cloned().unwrap_or_else(|| {
+                let count = match response.get("type").and_then(Value::as_str) {
+                    Some("describeViews") => response
+                        .get("views")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some("viewPartitionState") => response
+                        .get("partitions")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    _ => None,
+                };
+                count.map_or_else(
+                    || serde_json::json!({}),
+                    |count| serde_json::json!({ "counts": { "items": count } }),
+                )
+            });
+            serde_json::json!({
+                "component": "qq-index-view",
+                "operation": operation,
+                "outcome": "ok",
+                "elapsedMicros": elapsed_micros.to_string(),
+                "details": details,
+            })
+        }
+        Err(error) => serde_json::json!({
+            "component": "qq-index-view",
+            "operation": operation,
+            "outcome": "error",
+            "elapsedMicros": elapsed_micros.to_string(),
+            "errorCode": error.code(),
+        }),
+    }
 }
 
 fn check_deadline(deadline_unix_ms: u64) -> Result<(), ProtocolError> {
@@ -665,5 +819,50 @@ mod tests {
             queue_capacity: 8,
         };
         assert!(validate_paths(&relative).is_err());
+    }
+    #[test]
+    fn view_query_lifecycle_and_error_logs_are_content_redacted() {
+        let telemetry = serde_json::json!({
+            "operation": "execute",
+            "outcome": "ok",
+            "elapsedMicros": "7",
+            "phasesMicros": { "indexedPlan": "5" },
+            "counts": { "results": "1" },
+        });
+        let query = Ok((
+            serde_json::json!({
+                "type": "execute",
+                "result": { "sessions": [{ "sessionId": "query-session-secret", "body": "document-secret" }] },
+                "telemetry": telemetry,
+            }),
+            false,
+        ));
+        let query_log = view_telemetry_record("execute", 9, &query).to_string();
+        assert!(!query_log.contains("query-session-secret"));
+        assert!(!query_log.contains("document-secret"));
+        assert!(query_log.contains("indexedPlan"));
+
+        let lifecycle = Ok((
+            serde_json::json!({
+                "type": "mutateView",
+                "partitionKey": "lifecycle-session-secret",
+                "telemetry": {
+                    "operation": "activate", "outcome": "ok", "elapsedMicros": "3",
+                    "phasesMicros": {}, "counts": {}
+                }
+            }),
+            false,
+        ));
+        let lifecycle_log = view_telemetry_record("set-view-lifecycle", 4, &lifecycle).to_string();
+        assert!(!lifecycle_log.contains("lifecycle-session-secret"));
+        assert!(lifecycle_log.contains("activate"));
+
+        let error: Result<(Value, bool), ProtocolError> = Err(ProtocolError::InvalidRequest(
+            "query literal and document secret".to_owned(),
+        ));
+        let error_log = view_telemetry_record("execute", 2, &error).to_string();
+        assert!(!error_log.contains("literal"));
+        assert!(!error_log.contains("document"));
+        assert!(error_log.contains("invalid_request"));
     }
 }

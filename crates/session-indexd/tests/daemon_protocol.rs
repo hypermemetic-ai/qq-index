@@ -4,6 +4,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use qq_session_indexd::{DatabaseMode, PROTOCOL_VERSION, ServerConfig, run};
 use serde_json::{Value, json};
 
 const DEADLINE: u64 = 9_999_999_999_999;
+static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn start(config: ServerConfig) -> thread::JoinHandle<Result<(), qq_session_indexd::ServerError>> {
     thread::spawn(move || run(&config))
@@ -81,6 +83,7 @@ fn search_operation() -> Value {
 
 #[test]
 fn create_apply_search_shutdown_restart_and_socket_safety() {
+    let _test_guard = DAEMON_TEST_LOCK.lock().expect("daemon test lock");
     let root = tempfile::tempdir().expect("temporary generated root");
     let socket = root.path().join("private").join("index.sock");
     let database = root.path().join("generated.db");
@@ -307,4 +310,162 @@ fn create_apply_search_shutdown_restart_and_socket_safety() {
         untouched
     );
     assert!(!should_not_exist.exists());
+}
+
+#[test]
+fn compiled_view_v2_protocol_is_bounded_authorized_and_isolated() {
+    let _test_guard = DAEMON_TEST_LOCK.lock().expect("daemon test lock");
+    let root = tempfile::tempdir().expect("temporary V2 daemon root");
+    let socket = root.path().join("private").join("views.sock");
+    let database = root.path().join("legacy.db");
+    let daemon = start(ServerConfig {
+        socket_path: socket.clone(),
+        database_path: database.clone(),
+        database_mode: DatabaseMode::Create,
+        readers: 1,
+        queue_capacity: 4,
+    });
+    let mut reader = BufReader::new(connect_bounded(&socket));
+    let token = "waaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let view = json!({"id":"qq.session.conversation", "version":1});
+
+    let described = call(
+        &mut reader,
+        "views-describe",
+        json!({
+            "type":"describeViews", "version":"qq-index-view-describe/v1"
+        }),
+    );
+    assert_eq!(described["ok"], true, "describe response: {described}");
+    assert_eq!(
+        described["response"]["views"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        described["response"]["views"]
+            .as_array()
+            .expect("views")
+            .iter()
+            .any(|entry| entry["manifest"]["id"] == "qq.test.exact-range"
+                && entry["manifest"]["testOnly"] == true)
+    );
+
+    let replaced = call(
+        &mut reader,
+        "views-replace",
+        json!({
+            "type":"mutateView", "version":"qq-index-view-mutation/v1",
+            "mutation": {
+                "kind":"replacePartition", "view":view, "partitionKey":"session-v2",
+                "source": {
+                    "sourceIdentity":"lifecycle-v2", "durableRevision":"revision-1",
+                    "nextCursor":"1", "sourceFence":"fence-1", "lagMs":5
+                },
+                "rows":[{
+                    "rowKey":"session-v2:0", "sessionId":"session-v2", "seq":0,
+                    "eventTimeUnixMs":1000, "eventType":"message/generated", "surface":"current",
+                    "workspaceScopeToken":token, "body":"amber telescope generated protocol",
+                    "fingerprint":"fingerprint-v2", "sessionTitle":"V2 generated title",
+                    "sessionUpdatedAtUnixMs":2000
+                }]
+            }
+        }),
+    );
+    assert_eq!(replaced["ok"], true, "replace response: {replaced}");
+    assert_eq!(replaced["response"]["nextCursor"], "1");
+    assert_eq!(
+        replaced["response"]["telemetry"]["counts"]["affectedRows"],
+        "1"
+    );
+
+    let execute = || {
+        json!({
+            "type":"execute", "version":"qq-index-query/v1", "view":view,
+            "access":"literal-session-search",
+            "params":{"literals":["amber telescope"], "limit":10, "eventTypes":[], "surfaces":[]},
+            "authority":{"kind":"workspace-token-set/v1", "scopeTokens":[token]},
+            "freshness":{"mode":"caught-up", "maxLagMs":10}
+        })
+    };
+    let building = call(&mut reader, "views-building", execute());
+    assert_eq!(building["ok"], false);
+    assert_eq!(building["error"]["code"], "view_building");
+
+    let activated = call(
+        &mut reader,
+        "views-activate",
+        json!({
+            "type":"setViewLifecycle", "version":"qq-index-view-lifecycle/v1", "view":view,
+            "state":"ready", "sourceFence":"fence-live", "lagMs":5
+        }),
+    );
+    assert_eq!(activated["ok"], true, "activation response: {activated}");
+    assert_eq!(activated["response"]["state"], "ready");
+
+    let queried = call(&mut reader, "views-query", execute());
+    assert_eq!(queried["ok"], true, "query response: {queried}");
+    assert_eq!(
+        queried["response"]["result"]["sessions"][0]["sessionId"],
+        "session-v2"
+    );
+    assert_eq!(queried["response"]["snapshot"]["sourceFence"], "fence-live");
+    assert_eq!(queried["response"]["telemetry"]["counts"]["results"], "1");
+    let telemetry_text =
+        serde_json::to_string(&queried["response"]["telemetry"]).expect("telemetry JSON");
+    assert!(!telemetry_text.contains("amber"));
+    assert!(!telemetry_text.contains("session-v2"));
+
+    let wrong_scope = call(
+        &mut reader,
+        "views-wrong-scope",
+        json!({
+            "type":"execute", "version":"qq-index-query/v1", "view":view,
+            "access":"literal-session-search",
+            "params":{"literals":["amber telescope"], "limit":10},
+            "authority":{"kind":"workspace-token-set/v1", "scopeTokens":["wbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]},
+            "freshness":{"mode":"caught-up", "maxLagMs":10}
+        }),
+    );
+    assert_eq!(wrong_scope["ok"], true);
+    assert!(
+        wrong_scope["response"]["result"]["sessions"]
+            .as_array()
+            .expect("sessions")
+            .is_empty()
+    );
+
+    let unknown = call(
+        &mut reader,
+        "views-unknown",
+        json!({
+            "type":"execute", "version":"qq-index-query/v1",
+            "view":{"id":"qq.unknown", "version":1}, "access":"unknown", "params":{},
+            "authority":{"kind":"workspace-token-set/v1", "scopeTokens":[token]},
+            "freshness":{"mode":"caught-up", "maxLagMs":10}
+        }),
+    );
+    assert_eq!(unknown["ok"], false);
+    assert_eq!(unknown["error"]["code"], "unsupported_view");
+
+    // Fail the unrelated test-only view and prove the conversation handler stays ready.
+    let failed = call(
+        &mut reader,
+        "views-fail-second",
+        json!({
+            "type":"setViewLifecycle", "version":"qq-index-view-lifecycle/v1",
+            "view":{"id":"qq.test.exact-range", "version":1}, "state":"failed",
+            "sourceFence":"test-failed", "lagMs":0
+        }),
+    );
+    assert_eq!(failed["ok"], true);
+    let still_ready = call(&mut reader, "views-query-after-isolated-failure", execute());
+    assert_eq!(still_ready["ok"], true);
+
+    shutdown(&mut reader);
+    drop(reader);
+    daemon
+        .join()
+        .expect("join V2 daemon")
+        .expect("V2 daemon exit");
+    assert!(database.with_file_name("legacy.db.views-v2").is_dir());
 }
