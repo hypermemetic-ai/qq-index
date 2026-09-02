@@ -566,15 +566,19 @@ Domain-separated SHA-256 fingerprints and source revisions cover the canonical
 generated fields. No grant is projected.
 
 `start()` installs the live subscription before `listSessions(signal)`. It reads
-bounded daemon `sourceState` snapshots, fully validates every listed current log,
-and sends only each durable `nextSeq` suffix. Batches obey daemon document/payload
-limits and have deterministic payload fingerprints/idempotency keys; every
-successful commit advances the global source watermark monotonically. IDs
-observed while listing/reading are buffered, then reread and resumed from fresh
-durable cursors. After catch-up, notifications feed one bounded serialized queue.
-A normal live notification rereads the log for validation but submits only its
-uncommitted suffix, never a whole-session reinsert. Crash/restart performs the
-same full validation and starts from daemon cursors rather than sequence zero.
+bounded daemon `sourceState` snapshots and one authoritative replay-validated log
+for every listed session. A strict production log whose raw event count exactly
+equals its durable cursor and whose workspace identity still matches skips all
+projection helpers and commits. Missing or behind cursors and any generated,
+ambiguous, malformed, or unverifiable shape retain complete projection and send
+only the durable `nextSeq` suffix; ahead cursors and workspace conflicts reject.
+Batches obey daemon document/payload limits and have deterministic payload
+fingerprints/idempotency keys; every successful commit advances the global source
+watermark monotonically. IDs observed while listing/reading are buffered, then
+reread and resumed from fresh durable cursors. After catch-up, notifications feed
+one bounded serialized queue. A normal live notification rereads the authoritative
+log and submits only its uncommitted suffix, never a whole-session reinsert.
+Crash/restart starts from daemon cursors rather than sequence zero.
 
 `status()` contains phase, sessions scanned, raw events committed, projected
 rows/documents committed, buffered-session count, watermark and a bounded
