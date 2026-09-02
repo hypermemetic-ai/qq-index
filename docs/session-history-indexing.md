@@ -596,22 +596,26 @@ cutover is complete.
 `verifyDshSearchCandidates({ searchResponse, sessionQuery, literals,
 eventTypeAllowList, surfaceAllowList, maxConcurrency?, maxCandidates?, signal?,
 extractSessionEventText? })` accepts an already-authorized search response and
-explicit event-type/surface allow lists. Production verification prefers
-`filterEvents(sessionId, [{ kind: 'seq', from, to }])` and requires one
-authoritative semantic document with matching coordinate, type, surface, and
-literal text. rc.7 does not define a signal parameter for `filterEvents`, so an
-abort stops new work and rejects after the current at-most-`maxConcurrency` reads
-settle. Its `readEvent(request, signal?)` form does support the signal in the
-second position. The generated positional `readEvent(sessionId, seq)` form remains
-a fallback only and receives no new argument; a real raw
-`readEvent({ sessionId, seq, before, after }).target` has no authoritative surface
-and cannot alone verify evidence. The helper checks cancellation before scheduling,
-throughout worker/output loops, and around reads. Cancellation and abort failures
-reject the whole verification—never a successful partial response—while ordinary
-read failures remain fail-closed omissions. It deduplicates coordinates, bounds
-exact-read concurrency/cardinality, and fails closed on missing, stale, duplicate,
-malformed, or mismatched source observations. It does not authorize a workspace,
-session, type, or surface.
+explicit event-type/surface allow lists. Production verification feature-detects
+only `readEventDocumentSnapshots(requests, signal?)`, groups exact coordinates by
+session, and makes one call for the normal at-most-256-coordinate set. Larger
+configured sets use deterministic bounded chunks. It strictly validates settlement
+order/cardinality, headers, documents, and optional title snapshots before binding
+observations by exact `(sessionId, seq)`. Valid session rejections and omitted seqs
+fail affected candidates closed; malformed batch structure rejects the operation.
+Only candidates with exact evidence for every fused contribution survive. Evidence
+contains authoritative safe event time and a whitespace-normalized, literal-centered
+snippet bounded by both 320 UTF-16 code units and 1280 UTF-8 bytes; an authoritative
+title is exposed only as a trimmed, prefix-clipped string bounded by 256 code units
+and 1024 bytes.
+
+When the grouped method is absent, the bounded `filterEvents` / `readEvent` worker
+fallback is unchanged. rc.7 does not define a signal parameter for `filterEvents`,
+so abort stops new work and rejects after current reads settle. Its
+`readEvent(request, signal?)` form receives the signal in the second position; the
+generated positional form receives no new argument. Cancellation rejects the whole
+verification, while ordinary fallback read failures remain fail-closed omissions.
+The helper does not authorize a workspace, session, type, or surface.
 
 The production mount and supervision contract is documented in
 [`session-index-production.md`](session-index-production.md). This bridge remains append-only. Source replacement can leave earlier

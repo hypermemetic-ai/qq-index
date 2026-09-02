@@ -17,6 +17,13 @@ const MAX_BATCH_PAYLOAD_BYTES = 768 * 1_024;
 const MAX_CORPUS_SESSIONS = 100_000;
 const MAX_EXACT_CANDIDATES = 1_024;
 const MAX_EXACT_CONCURRENCY = 32;
+const MAX_SNAPSHOT_GROUPS = 256;
+const MAX_SNAPSHOT_COORDINATES = 256;
+const MAX_SNIPPET_CODE_UNITS = 320;
+const MAX_SNIPPET_BYTES = 1_280;
+const MAX_TITLE_CODE_UNITS = 256;
+const MAX_TITLE_BYTES = 1_024;
+const MAX_TITLE_SOURCE_SEQS = 4_096;
 const LIVE_TOPICS = new Set(["session/created", "session/event", "session/disposed"]);
 
 /**
@@ -544,16 +551,17 @@ export async function verifyDshSearchCandidates(options) {
   const signal = validateAbortSignal(options.signal);
   plainObject(options.searchResponse, "options.searchResponse");
   plainObject(options.sessionQuery, "options.sessionQuery");
-  if (typeof options.sessionQuery.filterEvents !== "function"
-      && typeof options.sessionQuery.readEvent !== "function") {
-    throw new TypeError("sessionQuery must provide filterEvents or readEvent");
-  }
   if (options.extractSessionEventText !== undefined) {
     callable(options.extractSessionEventText, "options.extractSessionEventText");
   }
   stringArray(options.literals, "options.literals", 1, 5, 500);
   stringArray(options.eventTypeAllowList, "options.eventTypeAllowList", 1, 32, MAX_EVENT_TYPE_BYTES);
   stringArray(options.surfaceAllowList, "options.surfaceAllowList", 1, 32, MAX_SURFACE_BYTES);
+  const normalizedLiterals = options.literals.map((literal, index) => {
+    const normalized = normalizeWhitespace(literal);
+    if (normalized.length === 0) throw new TypeError(`options.literals[${index}] must not be whitespace-only`);
+    return normalized;
+  });
   const maxConcurrency = boundedOption(options.maxConcurrency, 4, 1, MAX_EXACT_CONCURRENCY, "maxConcurrency");
   const maxCandidates = boundedOption(options.maxCandidates, 256, 1, MAX_EXACT_CANDIDATES, "maxCandidates");
   if (!Array.isArray(options.searchResponse.sources)
@@ -578,15 +586,16 @@ export async function verifyDshSearchCandidates(options) {
     const queryOrdinal = Number.isSafeInteger(source.queryOrdinal)
       ? source.queryOrdinal
       : sourceOrdinal;
-    for (const [rankIndex, hit] of source.ranked.entries()) {
+    for (const hit of source.ranked) {
       throwIfAborted(signal);
       plainObject(hit, "ranked search hit");
+      const sourceRank = boundedIntegerValue(hit.rank, "ranked search hit rank", 1, 100);
       plainObject(hit.evidence, "search evidence");
       boundedString(hit.evidence.sessionId, "evidence sessionId", 1, MAX_SESSION_ID_BYTES);
       const seq = parseUnsigned(hit.evidence.seq, "evidence seq");
       if (queryOrdinal < 0 || queryOrdinal >= options.literals.length) continue;
 
-      const references = referencesBySourceHit.get(sourceHitKey(queryOrdinal, rankIndex + 1));
+      const references = referencesBySourceHit.get(sourceHitKey(queryOrdinal, sourceRank));
       if (references === undefined
           || !references.some((reference) => fusedReferenceMatchesHit(reference, hit, seq))) continue;
       if (pointersSeen >= maxCandidates) continue;
@@ -600,6 +609,7 @@ export async function verifyDshSearchCandidates(options) {
           pointers: [],
           event: null,
           text: null,
+          eventTimeUnixMs: null,
         };
         coordinates.set(key, coordinate);
       }
@@ -609,45 +619,25 @@ export async function verifyDshSearchCandidates(options) {
   }
 
   const work = [...coordinates.values()];
-  let cursor = 0;
-  let cancellationError = null;
+  const titlesBySession = new Map();
   throwIfAborted(signal);
-  const workers = Array.from({ length: Math.min(maxConcurrency, work.length) }, async () => {
-    while (cursor < work.length) {
-      throwIfAborted(signal);
-      if (cancellationError !== null) throw cancellationError;
-      const coordinate = work[cursor++];
-      throwIfAborted(signal);
-      try {
-        const observation = await readAuthoritativeDocument(options, coordinate, signal);
-        throwIfAborted(signal);
-        if (observation === null) continue;
-        coordinate.event = observation;
-        coordinate.text = observation.text;
-      } catch (error) {
-        try {
-          throwIfAborted(signal);
-        } catch (abortError) {
-          cancellationError = abortError;
-          throw abortError;
-        }
-        if (isAbortError(error)) {
-          cancellationError = error;
-          throw error;
-        }
-        // Stale/missing/unavailable exact reads are deliberately fail-closed.
-      }
+  if (work.length > 0) {
+    if (typeof options.sessionQuery.readEventDocumentSnapshots === "function") {
+      await readGroupedAuthoritativeDocuments(options, work, titlesBySession, signal);
+    } else if (typeof options.sessionQuery.filterEvents === "function"
+        || typeof options.sessionQuery.readEvent === "function") {
+      await readLegacyAuthoritativeDocuments(options, work, maxConcurrency, signal);
+    } else {
+      throw new TypeError(
+        "sessionQuery must provide readEventDocumentSnapshots, filterEvents, or readEvent",
+      );
     }
-  });
-  const workerResults = await Promise.allSettled(workers);
-  throwIfAborted(signal);
-  const rejectedWorker = workerResults.find(({ status }) => status === "rejected");
-  if (rejectedWorker !== undefined) throw rejectedWorker.reason;
+  }
 
-  const verifiedEvidence = [];
+  const observedEvidence = [];
   for (const coordinate of work) {
     throwIfAborted(signal);
-    if (coordinate.event === null) continue;
+    if (coordinate.event === null || coordinate.eventTimeUnixMs === null) continue;
     const actualType = firstString(
       coordinate.event.eventType,
       coordinate.event.event?.eventType,
@@ -656,42 +646,70 @@ export async function verifyDshSearchCandidates(options) {
     );
     const actualSurface = firstString(coordinate.event.surface, coordinate.event.event?.surface);
     if (!allowedTypes.has(actualType) || !allowedSurfaces.has(actualSurface)) continue;
+    const normalizedText = normalizeWhitespace(coordinate.text);
+    if (normalizedText.length === 0) continue;
     for (const { queryOrdinal, pointer } of coordinate.pointers) {
       throwIfAborted(signal);
       if (pointer.eventType !== actualType || pointer.surface !== actualSurface) continue;
-      if (!coordinate.text.includes(options.literals[queryOrdinal])) continue;
-      verifiedEvidence.push(Object.freeze({
+      const literal = normalizedLiterals[queryOrdinal];
+      const match = literalMatch(normalizedText, literal);
+      if (match === null) continue;
+      const evidence = Object.freeze({
         queryOrdinal,
         sessionId: coordinate.sessionId,
         seq: coordinate.seq,
         documentKey: pointer.documentKey,
         eventType: actualType,
         surface: actualSurface,
-      }));
+        eventTimeUnixMs: coordinate.eventTimeUnixMs,
+        snippet: centeredSnippet(normalizedText, match.index, match.length),
+      });
+      observedEvidence.push({ evidence, key: verificationEvidenceKey(evidence) });
     }
   }
 
-  const evidenceBySession = new Map();
-  for (const evidence of verifiedEvidence) {
-    throwIfAborted(signal);
-    const current = evidenceBySession.get(evidence.sessionId) ?? [];
-    current.push(evidence);
-    evidenceBySession.set(evidence.sessionId, current);
+  // Every pointer above is checked independently. Collapse only identical
+  // emitted evidence identities so the qq-core boundary never receives an
+  // ambiguous duplicate; query ordinals remain part of the identity.
+  const uniqueObservedEvidence = [];
+  const evidenceByKey = new Map();
+  for (const observed of observedEvidence) {
+    if (evidenceByKey.has(observed.key)) continue;
+    evidenceByKey.set(observed.key, observed.evidence);
+    uniqueObservedEvidence.push(observed);
   }
-  const verifiedCandidates = [];
+
+  const retained = [];
+  const retainedEvidenceKeys = new Set();
   for (const candidate of options.searchResponse.fused) {
     throwIfAborted(signal);
-    const evidence = evidenceBySession.get(candidate.sessionId);
-    if (evidence?.length > 0) {
-      verifiedCandidates.push(Object.freeze({
-        ...candidate,
-        evidence: Object.freeze([...evidence]),
-      }));
-    }
+    const contributionKeys = candidate.contributions.map((contribution) => verificationEvidenceKey({
+      sessionId: candidate.sessionId,
+      queryOrdinal: contribution.queryOrdinal,
+      seq: parseUnsigned(contribution.seq, "contribution seq").toString(),
+      documentKey: contribution.documentKey,
+    }));
+    if (!contributionKeys.every((key) => evidenceByKey.has(key))) continue;
+    const candidateKeySet = new Set(contributionKeys);
+    const evidence = uniqueObservedEvidence
+      .filter((observed) => candidateKeySet.has(observed.key))
+      .map((observed) => observed.evidence);
+    for (const key of candidateKeySet) retainedEvidenceKeys.add(key);
+    const { title: _untrustedCandidateTitle, ...candidateWithoutTitle } = candidate;
+    const authoritativeTitle = titlesBySession.get(candidate.sessionId);
+    retained.push(Object.freeze({
+      ...candidateWithoutTitle,
+      evidence: Object.freeze(evidence),
+      ...(authoritativeTitle === undefined ? {} : { title: authoritativeTitle }),
+    }));
   }
+
+  const verifiedEvidence = uniqueObservedEvidence
+    .filter((observed) => retainedEvidenceKeys.has(observed.key))
+    .map((observed) => observed.evidence);
   throwIfAborted(signal);
   return Object.freeze({
-    verifiedCandidates: Object.freeze(verifiedCandidates),
+    verifiedCandidates: Object.freeze(retained),
     verifiedEvidence: Object.freeze(verifiedEvidence),
   });
 }
@@ -702,8 +720,10 @@ function fusedReferencesBySourceHit(fusedCandidates, signal) {
     throwIfAborted(signal);
     plainObject(candidate, "fused search candidate");
     boundedString(candidate.sessionId, "fused sessionId", 1, MAX_SESSION_ID_BYTES);
-    if (!Array.isArray(candidate.contributions) || candidate.contributions.length > 5) {
-      throw new TypeError("fused contributions must be an array of at most 5 entries");
+    if (!Array.isArray(candidate.contributions)
+        || candidate.contributions.length < 1
+        || candidate.contributions.length > 5) {
+      throw new TypeError("fused contributions must be an array of 1..5 entries");
     }
     for (const contribution of candidate.contributions) {
       throwIfAborted(signal);
@@ -744,6 +764,383 @@ function fusedReferenceMatchesHit(reference, hit, seq) {
     && hit.evidence.sessionId === reference.sessionId
     && hit.evidence.documentKey === reference.documentKey
     && seq === reference.seq;
+}
+
+async function readGroupedAuthoritativeDocuments(options, work, titlesBySession, signal) {
+  const eligible = work.filter(({ seq }) => BigInt(seq) <= BigInt(Number.MAX_SAFE_INTEGER));
+  const coordinatesByKey = new Map(eligible.map((coordinate) => [
+    coordinateKey(coordinate.sessionId, BigInt(coordinate.seq)),
+    coordinate,
+  ]));
+  const rejectedSessions = new Set();
+  for (const requests of groupedSnapshotChunks(eligible)) {
+    throwIfAborted(signal);
+    const expectedRequests = requests.map(({ sessionId, seqs }) => ({ sessionId, seqs: [...seqs] }));
+    let response;
+    try {
+      // This is the sole batch capability. Its public contract always accepts
+      // the optional AbortSignal in the second position, including undefined.
+      response = await options.sessionQuery.readEventDocumentSnapshots(requests, signal);
+      throwIfAborted(signal);
+    } catch (error) {
+      rethrowCancellation(error, signal);
+      // Whole-call operational failures are unexpected under the settlement
+      // contract, but remain fail-closed for compatibility with ordinary reads.
+      continue;
+    }
+
+    // Parsing is intentionally outside the operational failure catch: any
+    // malformed batch invalidates the complete verification operation.
+    const parsed = validateSnapshotSettlements(response, expectedRequests);
+    for (const { sessionId, document } of parsed.documents) {
+      const coordinate = coordinatesByKey.get(coordinateKey(sessionId, BigInt(document.seq)));
+      if (coordinate === undefined) throw new TypeError("batch document is not a requested coordinate");
+      coordinate.event = document;
+      coordinate.text = document.text;
+      coordinate.eventTimeUnixMs = document.time;
+    }
+    for (const [sessionId, title] of parsed.titles) titlesBySession.set(sessionId, title);
+    for (const sessionId of parsed.rejectedSessions) rejectedSessions.add(sessionId);
+  }
+  if (rejectedSessions.size > 0) {
+    for (const coordinate of eligible) {
+      if (!rejectedSessions.has(coordinate.sessionId)) continue;
+      coordinate.event = null;
+      coordinate.text = null;
+      coordinate.eventTimeUnixMs = null;
+    }
+    for (const sessionId of rejectedSessions) titlesBySession.delete(sessionId);
+  }
+}
+
+function groupedSnapshotChunks(work) {
+  const bySession = new Map();
+  for (const coordinate of work) {
+    const current = bySession.get(coordinate.sessionId) ?? [];
+    current.push(Number(coordinate.seq));
+    bySession.set(coordinate.sessionId, current);
+  }
+
+  const chunks = [];
+  let current = [];
+  let currentCoordinates = 0;
+  const flush = () => {
+    if (current.length === 0) return;
+    chunks.push(current);
+    current = [];
+    currentCoordinates = 0;
+  };
+  for (const [sessionId, seqs] of bySession) {
+    if (seqs.length > MAX_SNAPSHOT_COORDINATES) {
+      // A large session cannot fit in one upstream call. Flush first so that a
+      // session is split only when its own requested coordinate count requires it.
+      // Full slices stay isolated; its remainder may share space with later sessions.
+      flush();
+      let offset = 0;
+      while (seqs.length - offset > MAX_SNAPSHOT_COORDINATES) {
+        chunks.push([{
+          sessionId,
+          seqs: seqs.slice(offset, offset + MAX_SNAPSHOT_COORDINATES),
+        }]);
+        offset += MAX_SNAPSHOT_COORDINATES;
+      }
+      if (offset < seqs.length) {
+        current.push({ sessionId, seqs: seqs.slice(offset) });
+        currentCoordinates = seqs.length - offset;
+      }
+      continue;
+    }
+    if (current.length >= MAX_SNAPSHOT_GROUPS
+        || currentCoordinates + seqs.length > MAX_SNAPSHOT_COORDINATES) flush();
+    current.push({ sessionId, seqs: [...seqs] });
+    currentCoordinates += seqs.length;
+  }
+  flush();
+  return chunks;
+}
+
+function validateSnapshotSettlements(response, requests) {
+  if (!Array.isArray(response)
+      || response.length !== requests.length
+      || response.length > MAX_SNAPSHOT_GROUPS) {
+    throw new TypeError("batch response must contain exactly one settlement per requested session");
+  }
+  const documents = [];
+  const titles = new Map();
+  const rejectedSessions = new Set();
+  for (const [index, settlement] of response.entries()) {
+    const name = `batch settlements[${index}]`;
+    strictRecord(settlement, name);
+    boundedString(settlement.sessionId, `${name}.sessionId`, 1, MAX_SESSION_ID_BYTES);
+    const request = requests[index];
+    if (settlement.sessionId !== request.sessionId) {
+      throw new TypeError(`${name}.sessionId must match requested session order`);
+    }
+    if (settlement.status === "rejected") {
+      exactRecord(settlement, ["sessionId", "status", "reason"], [], name);
+      rejectedSessions.add(request.sessionId);
+      continue;
+    }
+    if (settlement.status !== "fulfilled") {
+      throw new TypeError(`${name}.status must be fulfilled or rejected`);
+    }
+    exactRecord(settlement, ["sessionId", "status", "value"], [], name);
+    const valueName = `${name}.value`;
+    exactRecord(settlement.value, ["session", "documents"], ["title"], valueName);
+    validateSnapshotHeader(settlement.value.session, request.sessionId, `${valueName}.session`);
+    if (!Array.isArray(settlement.value.documents)
+        || settlement.value.documents.length > request.seqs.length
+        || settlement.value.documents.length > MAX_SNAPSHOT_COORDINATES) {
+      throw new TypeError(`${valueName}.documents exceeds requested coordinates`);
+    }
+    const requestedSeqs = new Set(request.seqs);
+    let previousSeq = -1;
+    for (const [documentIndex, document] of settlement.value.documents.entries()) {
+      const documentName = `${valueName}.documents[${documentIndex}]`;
+      validateSnapshotDocument(document, request.sessionId, documentName);
+      if (!requestedSeqs.has(document.seq)) {
+        throw new TypeError(`${documentName}.seq was not requested`);
+      }
+      if (document.seq <= previousSeq) {
+        throw new TypeError(`${valueName}.documents must be unique and in ascending seq order`);
+      }
+      previousSeq = document.seq;
+      documents.push({ sessionId: request.sessionId, document });
+    }
+    if (Object.hasOwn(settlement.value, "title")) {
+      titles.set(
+        request.sessionId,
+        validateAndFormatSnapshotTitle(settlement.value.title, `${valueName}.title`),
+      );
+    }
+  }
+  return { documents, titles, rejectedSessions };
+}
+
+function validateSnapshotHeader(header, sessionId, name) {
+  strictRecord(header, name);
+  for (const required of ["version", "id", "createdAt"]) {
+    if (!Object.hasOwn(header, required)) throw new TypeError(`${name} is missing ${required}`);
+  }
+  if (!Number.isSafeInteger(header.version) || header.version < 0) {
+    throw new TypeError(`${name}.version must be a non-negative safe integer`);
+  }
+  boundedString(header.id, `${name}.id`, 1, MAX_SESSION_ID_BYTES);
+  if (header.id !== sessionId) throw new TypeError(`${name}.id must match its settlement sessionId`);
+  nonnegativeSafeInteger(header.createdAt, `${name}.createdAt`);
+  if (Object.hasOwn(header, "cwd")) {
+    boundedString(header.cwd, `${name}.cwd`, 1, MAX_WORKSPACE_ID_BYTES);
+    if (!isAbsolute(header.cwd)) throw new TypeError(`${name}.cwd must be absolute`);
+  }
+  if (Object.hasOwn(header, "parentSession")) {
+    boundedString(header.parentSession, `${name}.parentSession`, 1, MAX_SESSION_ID_BYTES);
+  }
+  if (Object.hasOwn(header, "seedLength")) nonnegativeSafeInteger(header.seedLength, `${name}.seedLength`);
+  if (Object.hasOwn(header, "origin") && header.origin !== "subagent") {
+    throw new TypeError(`${name}.origin must be subagent`);
+  }
+  if (Object.hasOwn(header, "delegationDepth")) {
+    nonnegativeSafeInteger(header.delegationDepth, `${name}.delegationDepth`);
+  }
+  if (Object.hasOwn(header, "agentPreset")) {
+    boundedString(header.agentPreset, `${name}.agentPreset`, 0, MAX_WORKSPACE_ID_BYTES);
+  }
+}
+
+function validateSnapshotDocument(document, sessionId, name) {
+  exactRecord(document, ["sessionId", "seq", "type", "time", "surface", "text"], [], name);
+  boundedString(document.sessionId, `${name}.sessionId`, 1, MAX_SESSION_ID_BYTES);
+  if (document.sessionId !== sessionId) throw new TypeError(`${name}.sessionId is mismatched`);
+  nonnegativeSafeInteger(document.seq, `${name}.seq`);
+  if (!Number.isSafeInteger(document.time)) throw new TypeError(`${name}.time must be a safe integer`);
+  boundedString(document.type, `${name}.type`, 1, MAX_EVENT_TYPE_BYTES);
+  boundedString(document.surface, `${name}.surface`, 1, MAX_SURFACE_BYTES);
+  boundedString(document.text, `${name}.text`, 1, MAX_BODY_BYTES);
+}
+
+function validateAndFormatSnapshotTitle(snapshot, name) {
+  exactRecord(snapshot, ["title", "messageSeqs", "source", "eventSeq", "updatedAt"], [], name);
+  boundedString(snapshot.title, `${name}.title`, 1, MAX_BODY_BYTES);
+  const title = snapshot.title.trim();
+  if (title.length === 0) throw new TypeError(`${name}.title must not be whitespace-only`);
+  if (!Array.isArray(snapshot.messageSeqs) || snapshot.messageSeqs.length > MAX_TITLE_SOURCE_SEQS) {
+    throw new TypeError(`${name}.messageSeqs exceeds its bound`);
+  }
+  let previous = -1;
+  for (const [index, seq] of snapshot.messageSeqs.entries()) {
+    nonnegativeSafeInteger(seq, `${name}.messageSeqs[${index}]`);
+    if (seq <= previous) throw new TypeError(`${name}.messageSeqs must be unique and ascending`);
+    previous = seq;
+  }
+  validateSnapshotTitleSource(snapshot.source, `${name}.source`);
+  if ((snapshot.source.kind === "user") !== (snapshot.messageSeqs.length === 0)) {
+    throw new TypeError(`${name}.messageSeqs is inconsistent with its source`);
+  }
+  nonnegativeSafeInteger(snapshot.eventSeq, `${name}.eventSeq`);
+  nonnegativeSafeInteger(snapshot.updatedAt, `${name}.updatedAt`);
+  return prefixClipWithEllipsis(title, MAX_TITLE_CODE_UNITS, MAX_TITLE_BYTES);
+}
+
+function validateSnapshotTitleSource(source, name) {
+  strictRecord(source, name);
+  if (source.kind === "fallback" || source.kind === "user") {
+    exactRecord(source, ["kind"], [], name);
+    return;
+  }
+  if (source.kind !== "provider") throw new TypeError(`${name}.kind is invalid`);
+  exactRecord(source, ["kind", "provider"], ["model"], name);
+  boundedString(source.provider, `${name}.provider`, 1, MAX_WORKSPACE_ID_BYTES);
+  if (Object.hasOwn(source, "model")) {
+    exactRecord(source.model, ["provider", "model"], [], `${name}.model`);
+    boundedString(source.model.provider, `${name}.model.provider`, 1, MAX_WORKSPACE_ID_BYTES);
+    boundedString(source.model.model, `${name}.model.model`, 1, MAX_WORKSPACE_ID_BYTES);
+  }
+}
+
+async function readLegacyAuthoritativeDocuments(options, work, maxConcurrency, signal) {
+  let cursor = 0;
+  let cancellationError = null;
+  const workers = Array.from({ length: Math.min(maxConcurrency, work.length) }, async () => {
+    while (cursor < work.length) {
+      throwIfAborted(signal);
+      if (cancellationError !== null) throw cancellationError;
+      const coordinate = work[cursor++];
+      throwIfAborted(signal);
+      try {
+        const observation = await readAuthoritativeDocument(options, coordinate, signal);
+        throwIfAborted(signal);
+        if (observation === null) continue;
+        const observedTime = eventTime(observation, "authoritative event");
+        coordinate.event = observation;
+        coordinate.text = observation.text;
+        coordinate.eventTimeUnixMs = observedTime;
+      } catch (error) {
+        try {
+          throwIfAborted(signal);
+        } catch (abortError) {
+          cancellationError = abortError;
+          throw abortError;
+        }
+        if (isAbortError(error)) {
+          cancellationError = error;
+          throw error;
+        }
+        // Stale/missing/unavailable exact reads are deliberately fail-closed.
+      }
+    }
+  });
+  const workerResults = await Promise.allSettled(workers);
+  throwIfAborted(signal);
+  const rejectedWorker = workerResults.find(({ status }) => status === "rejected");
+  if (rejectedWorker !== undefined) throw rejectedWorker.reason;
+}
+
+function verificationEvidenceKey({ sessionId, queryOrdinal, seq, documentKey }) {
+  return `${Buffer.byteLength(sessionId, "utf8")}:${sessionId}:${queryOrdinal}:${seq}:`
+    + `${Buffer.byteLength(documentKey, "utf8")}:${documentKey}`;
+}
+
+function normalizeWhitespace(value) {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+function literalMatch(text, literal) {
+  const pattern = literal.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = new RegExp(pattern, "iu").exec(text);
+  return match === null ? null : { index: match.index, length: match[0].length };
+}
+
+function centeredSnippet(text, matchIndex, literalLength) {
+  if (text.length <= MAX_SNIPPET_CODE_UNITS
+      && Buffer.byteLength(text, "utf8") <= MAX_SNIPPET_BYTES) return text;
+  const points = [];
+  let offset = 0;
+  for (const value of text) {
+    const units = value.length;
+    points.push({ value, start: offset, end: offset + units, units, bytes: Buffer.byteLength(value, "utf8") });
+    offset += units;
+  }
+  const prefixUnits = [0];
+  const prefixBytes = [0];
+  for (const point of points) {
+    prefixUnits.push(prefixUnits.at(-1) + point.units);
+    prefixBytes.push(prefixBytes.at(-1) + point.bytes);
+  }
+  const matchEnd = matchIndex + literalLength;
+  let left = points.findIndex(({ end }) => end > matchIndex);
+  if (left < 0) left = points.length - 1;
+  let right = left;
+  while (right + 1 < points.length && points[right + 1].start < matchEnd) right += 1;
+  const fits = (from, to) => {
+    const edgeUnits = (from > 0 ? 1 : 0) + (to < points.length - 1 ? 1 : 0);
+    const edgeBytes = (from > 0 ? 3 : 0) + (to < points.length - 1 ? 3 : 0);
+    return prefixUnits[to + 1] - prefixUnits[from] + edgeUnits <= MAX_SNIPPET_CODE_UNITS
+      && prefixBytes[to + 1] - prefixBytes[from] + edgeBytes <= MAX_SNIPPET_BYTES;
+  };
+  if (!fits(left, right)) {
+    const center = matchIndex + literalLength / 2;
+    left = points.findIndex(({ end }) => end >= center);
+    if (left < 0) left = points.length - 1;
+    right = left;
+  }
+  const center = matchIndex + literalLength / 2;
+  while (left > 0 || right < points.length - 1) {
+    const canLeft = left > 0 && fits(left - 1, right);
+    const canRight = right < points.length - 1 && fits(left, right + 1);
+    if (!canLeft && !canRight) break;
+    if (canLeft && canRight) {
+      const leftContext = center - points[left].start;
+      const rightContext = points[right].end - center;
+      if (leftContext <= rightContext) left -= 1;
+      else right += 1;
+    } else if (canLeft) left -= 1;
+    else right += 1;
+  }
+  return `${left > 0 ? "…" : ""}${points.slice(left, right + 1).map(({ value }) => value).join("")}`
+    + `${right < points.length - 1 ? "…" : ""}`;
+}
+
+function prefixClipWithEllipsis(value, maximumCodeUnits, maximumBytes) {
+  if (value.length <= maximumCodeUnits && Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  let prefix = "";
+  let units = 0;
+  let bytes = 0;
+  for (const point of value) {
+    const pointUnits = point.length;
+    const pointBytes = Buffer.byteLength(point, "utf8");
+    if (units + pointUnits + 1 > maximumCodeUnits || bytes + pointBytes + 3 > maximumBytes) break;
+    prefix += point;
+    units += pointUnits;
+    bytes += pointBytes;
+  }
+  return `${prefix.trimEnd()}…`;
+}
+
+function nonnegativeSafeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+}
+
+function exactRecord(value, required, optional, name) {
+  strictRecord(value, name);
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || !allowed.has(key)) {
+      throw new TypeError(`${name} contains an unknown field`);
+    }
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) throw new TypeError(`${name} is missing ${key}`);
+  }
+}
+
+function strictRecord(value, name) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || (Object.getPrototypeOf(value) !== Object.prototype
+          && Object.getPrototypeOf(value) !== null)) {
+    throw new TypeError(`${name} must be a plain object`);
+  }
 }
 
 async function readAuthoritativeDocument(options, coordinate, signal) {

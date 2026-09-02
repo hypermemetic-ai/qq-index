@@ -135,7 +135,8 @@ const verification = await verifyDshSearchCandidates({
   searchResponse: {
     sources: [{
       queryOrdinal: 0,
-      ranked: ["good", "wrong-type", "wrong-surface", "stale-text", "missing"].map((sessionId) => ({
+      ranked: ["good", "wrong-type", "wrong-surface", "stale-text", "missing"].map((sessionId, index) => ({
+        rank: index + 1,
         sessionId,
         evidence: {
           sessionId,

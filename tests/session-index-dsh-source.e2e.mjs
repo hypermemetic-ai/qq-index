@@ -262,8 +262,8 @@ async function exactVerificationAssertions() {
   const missing = pointer("verify-missing", "0", "user/message", "current");
   const searchResponse = {
     sources: [
-      { queryOrdinal: 0, ranked: [ranked(good), ranked(badLiteral), ranked(badType)] },
-      { queryOrdinal: 1, ranked: [ranked(good), ranked(badSurface), ranked(missing)] },
+      { queryOrdinal: 0, ranked: [ranked(1, good), ranked(2, badLiteral), ranked(3, badType)] },
+      { queryOrdinal: 1, ranked: [ranked(1, good), ranked(2, badSurface), ranked(3, missing)] },
     ],
     fused: [
       fused("verify-good", [[0, 1, good], [1, 1, good]]),
@@ -322,8 +322,8 @@ function pointer(pointerSessionId, seq, eventType, surface) {
     documentKey: `generated:${pointerSessionId}:${seq}`,
   };
 }
-function ranked(evidence) {
-  return { sessionId: evidence.sessionId, evidence };
+function ranked(rank, evidence) {
+  return { rank, sessionId: evidence.sessionId, evidence };
 }
 function fused(fusedSessionId, references) {
   return {

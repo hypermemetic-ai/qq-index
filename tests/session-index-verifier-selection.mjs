@@ -7,6 +7,7 @@ await emptyFusedAssertions();
 await unusedThenReferencedAssertions();
 await malformedReferenceAssertions();
 await mismatchedReferenceAssertions();
+await gappedRankAssertions();
 await defaultBoundAssertions();
 await productionShapedExactReadCounts();
 console.log("session-index fused verifier selection: ok");
@@ -157,6 +158,23 @@ async function mismatchedReferenceAssertions() {
     { verifiedCandidates: [], verifiedEvidence: [] },
     "mismatched authoritative evidence must fail closed",
   );
+}
+
+async function gappedRankAssertions() {
+  const evidence = pointer("gapped-rank", "0");
+  const result = await verifyDshSearchCandidates({
+    ...verificationOptions({
+      sources: [{ queryOrdinal: 0, ranked: [ranked(2, evidence)] }],
+      fused: [fused("gapped-rank", 1, [contribution(0, 2, evidence)])],
+    }),
+    sessionQuery: {
+      async filterEvents(sessionId, filters) {
+        return [document(sessionId, filters[0].from, "canonical literal")];
+      },
+    },
+  });
+  assert.deepEqual(result.verifiedCandidates.map(({ sessionId }) => sessionId), ["gapped-rank"]);
+  assert.equal(result.verifiedCandidates[0].contributions[0].sourceRank, 2);
 }
 
 async function defaultBoundAssertions() {
