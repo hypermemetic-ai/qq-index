@@ -317,6 +317,7 @@ function pointer(pointerSessionId, seq, eventType, surface) {
   return {
     sessionId: pointerSessionId,
     seq,
+    eventTimeUnixMs: 1,
     eventType,
     surface,
     documentKey: `generated:${pointerSessionId}:${seq}`,

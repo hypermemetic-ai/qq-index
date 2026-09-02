@@ -613,7 +613,7 @@ export async function verifyDshSearchCandidates(options) {
         };
         coordinates.set(key, coordinate);
       }
-      coordinate.pointers.push({ queryOrdinal, pointer: hit.evidence });
+      coordinate.pointers.push({ queryOrdinal, sourceRank, pointer: hit.evidence });
       pointersSeen += 1;
     }
   }
@@ -648,8 +648,11 @@ export async function verifyDshSearchCandidates(options) {
     if (!allowedTypes.has(actualType) || !allowedSurfaces.has(actualSurface)) continue;
     const normalizedText = normalizeWhitespace(coordinate.text);
     if (normalizedText.length === 0) continue;
-    for (const { queryOrdinal, pointer } of coordinate.pointers) {
+    for (const { queryOrdinal, sourceRank, pointer } of coordinate.pointers) {
       throwIfAborted(signal);
+      const indexedEventTimeUnixMs = pointer.eventTimeUnixMs;
+      if (!Number.isSafeInteger(indexedEventTimeUnixMs)
+          || indexedEventTimeUnixMs !== coordinate.eventTimeUnixMs) continue;
       if (pointer.eventType !== actualType || pointer.surface !== actualSurface) continue;
       const literal = normalizedLiterals[queryOrdinal];
       const match = literalMatch(normalizedText, literal);
@@ -664,7 +667,11 @@ export async function verifyDshSearchCandidates(options) {
         eventTimeUnixMs: coordinate.eventTimeUnixMs,
         snippet: centeredSnippet(normalizedText, match.index, match.length),
       });
-      observedEvidence.push({ evidence, key: verificationEvidenceKey(evidence) });
+      observedEvidence.push({
+        evidence,
+        key: verificationEvidenceKey(evidence),
+        contributionKey: verificationContributionKey({ ...evidence, sourceRank }),
+      });
     }
   }
 
@@ -681,16 +688,30 @@ export async function verifyDshSearchCandidates(options) {
 
   const retained = [];
   const retainedEvidenceKeys = new Set();
+  // Prove each source-rank contribution before collapsing identical public
+  // evidence, so a valid duplicate pointer cannot bless a stale source rank.
+  const verifiedContributionKeys = new Set(observedEvidence.map(({ contributionKey }) => contributionKey));
   for (const candidate of options.searchResponse.fused) {
     throwIfAborted(signal);
-    const contributionKeys = candidate.contributions.map((contribution) => verificationEvidenceKey({
-      sessionId: candidate.sessionId,
-      queryOrdinal: contribution.queryOrdinal,
-      seq: parseUnsigned(contribution.seq, "contribution seq").toString(),
-      documentKey: contribution.documentKey,
-    }));
-    if (!contributionKeys.every((key) => evidenceByKey.has(key))) continue;
-    const candidateKeySet = new Set(contributionKeys);
+    const contributionIdentities = candidate.contributions.map((contribution) => {
+      const identity = {
+        sessionId: candidate.sessionId,
+        queryOrdinal: contribution.queryOrdinal,
+        seq: parseUnsigned(contribution.seq, "contribution seq").toString(),
+        documentKey: contribution.documentKey,
+      };
+      return {
+        evidenceKey: verificationEvidenceKey(identity),
+        contributionKey: verificationContributionKey({
+          ...identity,
+          sourceRank: contribution.sourceRank,
+        }),
+      };
+    });
+    if (!contributionIdentities.every(({ contributionKey }) => (
+      verifiedContributionKeys.has(contributionKey)
+    ))) continue;
+    const candidateKeySet = new Set(contributionIdentities.map(({ evidenceKey }) => evidenceKey));
     const evidence = uniqueObservedEvidence
       .filter((observed) => candidateKeySet.has(observed.key))
       .map((observed) => observed.evidence);
@@ -1038,6 +1059,10 @@ async function readLegacyAuthoritativeDocuments(options, work, maxConcurrency, s
 function verificationEvidenceKey({ sessionId, queryOrdinal, seq, documentKey }) {
   return `${Buffer.byteLength(sessionId, "utf8")}:${sessionId}:${queryOrdinal}:${seq}:`
     + `${Buffer.byteLength(documentKey, "utf8")}:${documentKey}`;
+}
+
+function verificationContributionKey(identity) {
+  return `${sourceHitKey(identity.queryOrdinal, identity.sourceRank)}:${verificationEvidenceKey(identity)}`;
 }
 
 function normalizeWhitespace(value) {

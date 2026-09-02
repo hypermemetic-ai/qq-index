@@ -7,6 +7,7 @@ await emptyFusedAssertions();
 await unusedThenReferencedAssertions();
 await malformedReferenceAssertions();
 await mismatchedReferenceAssertions();
+await legacyEventTimeIdentityAssertions();
 await gappedRankAssertions();
 await defaultBoundAssertions();
 await productionShapedExactReadCounts();
@@ -157,6 +158,26 @@ async function mismatchedReferenceAssertions() {
     authoritativeMismatch,
     { verifiedCandidates: [], verifiedEvidence: [] },
     "mismatched authoritative evidence must fail closed",
+  );
+}
+
+async function legacyEventTimeIdentityAssertions() {
+  const stale = { ...pointer("legacy-stale-time", "0"), eventTimeUnixMs: 2 };
+  const result = await verifyDshSearchCandidates({
+    ...verificationOptions({
+      sources: [{ queryOrdinal: 0, ranked: [ranked(1, stale)] }],
+      fused: [fused("legacy-stale-time", 1, [contribution(0, 1, stale)])],
+    }),
+    sessionQuery: {
+      async filterEvents(sessionId, filters) {
+        return [document(sessionId, filters[0].from, "canonical literal")];
+      },
+    },
+  });
+  assert.deepEqual(
+    result,
+    { verifiedCandidates: [], verifiedEvidence: [] },
+    "legacy authoritative reads must reject a stale pointer time",
   );
 }
 

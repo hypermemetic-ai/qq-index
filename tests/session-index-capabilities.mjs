@@ -233,6 +233,7 @@ function pointer(sessionId) {
   return {
     sessionId,
     seq: "0",
+    eventTimeUnixMs: 1,
     eventType: "user/message",
     surface: "current",
     documentKey: `generated:${sessionId}:0`,
