@@ -533,9 +533,11 @@ class DshSessionIndexSource {
  * Exact-read verification for already-authorized search output.
  *
  * This helper never derives or grants access. The caller supplies the permitted
- * event types and surfaces. Missing/stale source events and ordinary read failures
- * are omitted (fail closed), cancellation rejects the whole operation, and each
- * (sessionId, seq) coordinate is read once. options.signal is optional.
+ * event types and surfaces. Exact reads are scheduled only for ranked source
+ * pointers referenced by fused contributions; unused ranked hits cause no read.
+ * Missing/stale source events and ordinary read failures are omitted (fail closed),
+ * cancellation rejects the whole operation, and each (sessionId, seq) coordinate
+ * is read once. options.signal is optional.
  */
 export async function verifyDshSearchCandidates(options) {
   plainObject(options, "options");
@@ -565,6 +567,7 @@ export async function verifyDshSearchCandidates(options) {
 
   const allowedTypes = new Set(options.eventTypeAllowList);
   const allowedSurfaces = new Set(options.surfaceAllowList);
+  const referencesBySourceHit = fusedReferencesBySourceHit(options.searchResponse.fused, signal);
   const coordinates = new Map();
   let pointersSeen = 0;
   for (const [sourceOrdinal, source] of options.searchResponse.sources.entries()) {
@@ -572,16 +575,22 @@ export async function verifyDshSearchCandidates(options) {
     if (!Array.isArray(source.ranked) || source.ranked.length > 100) {
       throw new TypeError("search source ranked must be an array of at most 100 hits");
     }
-    for (const hit of source.ranked) {
+    const queryOrdinal = Number.isSafeInteger(source.queryOrdinal)
+      ? source.queryOrdinal
+      : sourceOrdinal;
+    for (const [rankIndex, hit] of source.ranked.entries()) {
       throwIfAborted(signal);
-      if (pointersSeen >= maxCandidates) break;
+      plainObject(hit, "ranked search hit");
       plainObject(hit.evidence, "search evidence");
       boundedString(hit.evidence.sessionId, "evidence sessionId", 1, MAX_SESSION_ID_BYTES);
       const seq = parseUnsigned(hit.evidence.seq, "evidence seq");
-      const queryOrdinal = Number.isSafeInteger(source.queryOrdinal)
-        ? source.queryOrdinal
-        : sourceOrdinal;
       if (queryOrdinal < 0 || queryOrdinal >= options.literals.length) continue;
+
+      const references = referencesBySourceHit.get(sourceHitKey(queryOrdinal, rankIndex + 1));
+      if (references === undefined
+          || !references.some((reference) => fusedReferenceMatchesHit(reference, hit, seq))) continue;
+      if (pointersSeen >= maxCandidates) continue;
+
       const key = coordinateKey(hit.evidence.sessionId, seq);
       let coordinate = coordinates.get(key);
       if (coordinate === undefined) {
@@ -685,6 +694,56 @@ export async function verifyDshSearchCandidates(options) {
     verifiedCandidates: Object.freeze(verifiedCandidates),
     verifiedEvidence: Object.freeze(verifiedEvidence),
   });
+}
+
+function fusedReferencesBySourceHit(fusedCandidates, signal) {
+  const references = new Map();
+  for (const candidate of fusedCandidates) {
+    throwIfAborted(signal);
+    plainObject(candidate, "fused search candidate");
+    boundedString(candidate.sessionId, "fused sessionId", 1, MAX_SESSION_ID_BYTES);
+    if (!Array.isArray(candidate.contributions) || candidate.contributions.length > 5) {
+      throw new TypeError("fused contributions must be an array of at most 5 entries");
+    }
+    for (const contribution of candidate.contributions) {
+      throwIfAborted(signal);
+      plainObject(contribution, "fused contribution");
+      const queryOrdinal = boundedIntegerValue(
+        contribution.queryOrdinal,
+        "contribution queryOrdinal",
+        0,
+        4,
+      );
+      const sourceRank = boundedIntegerValue(
+        contribution.sourceRank,
+        "contribution sourceRank",
+        1,
+        100,
+      );
+      boundedString(contribution.documentKey, "contribution documentKey", 1, 512);
+      const seq = parseUnsigned(contribution.seq, "contribution seq");
+      const key = sourceHitKey(queryOrdinal, sourceRank);
+      const current = references.get(key) ?? [];
+      current.push({
+        sessionId: candidate.sessionId,
+        documentKey: contribution.documentKey,
+        seq,
+      });
+      references.set(key, current);
+    }
+  }
+  return references;
+}
+
+function sourceHitKey(queryOrdinal, sourceRank) {
+  return `${queryOrdinal}:${sourceRank}`;
+}
+
+function fusedReferenceMatchesHit(reference, hit, seq) {
+  return hit.sessionId === reference.sessionId
+    && hit.evidence.sessionId === reference.sessionId
+    && hit.evidence.documentKey === reference.documentKey
+    && seq === reference.seq;
 }
 
 async function readAuthoritativeDocument(options, coordinate, signal) {
@@ -962,6 +1021,13 @@ function stringArray(value, name, minimum, maximum, maximumBytes) {
     if (unique.has(item)) throw new TypeError(`${name} must not contain duplicates`);
     unique.add(item);
   }
+}
+
+function boundedIntegerValue(value, name, minimum, maximum) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new TypeError(`${name} must be an integer in ${minimum}..${maximum}`);
+  }
+  return value;
 }
 
 function boundedOption(value, fallback, minimum, maximum, name) {

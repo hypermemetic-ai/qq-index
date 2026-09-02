@@ -266,11 +266,11 @@ async function exactVerificationAssertions() {
       { queryOrdinal: 1, ranked: [ranked(good), ranked(badSurface), ranked(missing)] },
     ],
     fused: [
-      fused("verify-good"),
-      fused("verify-bad-literal"),
-      fused("verify-bad-type"),
-      fused("verify-bad-surface"),
-      fused("verify-missing"),
+      fused("verify-good", [[0, 1, good], [1, 1, good]]),
+      fused("verify-bad-literal", [[0, 2, badLiteral]]),
+      fused("verify-bad-type", [[0, 3, badType]]),
+      fused("verify-bad-surface", [[1, 2, badSurface]]),
+      fused("verify-missing", [[1, 3, missing]]),
     ],
   };
   const sourceEvents = new Map([
@@ -325,8 +325,20 @@ function pointer(pointerSessionId, seq, eventType, surface) {
 function ranked(evidence) {
   return { sessionId: evidence.sessionId, evidence };
 }
-function fused(fusedSessionId) {
-  return { rank: 1, sessionId: fusedSessionId, rrfScore: 0.1, contributions: [] };
+function fused(fusedSessionId, references) {
+  return {
+    rank: 1,
+    sessionId: fusedSessionId,
+    rrfScore: 0.1,
+    contributions: references.map(([queryOrdinal, sourceRank, evidence]) => ({
+      queryOrdinal,
+      sourceRank,
+      contribution: 0.1,
+      documentKey: evidence.documentKey,
+      seq: evidence.seq,
+      snippet: null,
+    })),
+  };
 }
 
 async function forceCleanup() {
@@ -359,6 +371,8 @@ try {
   await exactVerificationAssertions();
   const binary = await ensureDaemon();
   const daemon = spawnDaemon(binary);
+  const warmupClient = await connectBoundedly(daemon);
+  await warmupClient.close();
   const applied = [];
   const source = createDshSessionIndexSource({
     sessionQuery,

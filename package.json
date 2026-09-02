@@ -23,7 +23,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/plugin.mjs && node tests/session-index-runtime.mjs && node tests/session-index-capabilities.mjs && node tests/session-index-launcher.mjs && node tests/session-index-dsh-production.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-dsh-e2e && npm run test:session-index-e2e",
+    "test": "node tests/plugin.mjs && node tests/session-index-runtime.mjs && node tests/session-index-capabilities.mjs && node tests/session-index-verifier-selection.mjs && node tests/session-index-launcher.mjs && node tests/session-index-dsh-production.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-dsh-e2e && npm run test:session-index-e2e",
     "benchmark:session-history": "python3 benchmarks/session_history_fts5.py",
     "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled",
     "rust:fmt": "cargo fmt --check",

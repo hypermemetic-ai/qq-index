@@ -203,13 +203,26 @@ function responseFor(sessionIds, { duplicateFirst = false } = {}) {
     evidence: pointer(sessionId),
   }));
   if (duplicateFirst && ranked.length > 0) ranked.splice(1, 0, structuredClone(ranked[0]));
+  const sourceRanks = new Map();
+  for (const [index, hit] of ranked.entries()) {
+    const ranks = sourceRanks.get(hit.sessionId) ?? [];
+    ranks.push(index + 1);
+    sourceRanks.set(hit.sessionId, ranks);
+  }
   return {
     sources: [{ queryOrdinal: 0, ranked }],
-    fused: sessionIds.slice(0, 100).map((sessionId) => ({
-      rank: 1,
+    fused: sessionIds.slice(0, 100).map((sessionId, index) => ({
+      rank: index + 1,
       sessionId,
       rrfScore: 0.1,
-      contributions: [],
+      contributions: sourceRanks.get(sessionId).map((sourceRank) => ({
+        queryOrdinal: 0,
+        sourceRank,
+        contribution: 0.1,
+        documentKey: pointer(sessionId).documentKey,
+        seq: "0",
+        snippet: null,
+      })),
     })),
   };
 }
