@@ -146,11 +146,18 @@ const verification = await verifyDshSearchCandidates({
         },
       })),
     }],
-    fused: ["good", "wrong-type", "wrong-surface", "stale-text", "missing"].map((sessionId) => ({
-      rank: 1,
+    fused: ["good", "wrong-type", "wrong-surface", "stale-text", "missing"].map((sessionId, index) => ({
+      rank: index + 1,
       sessionId,
       rrfScore: 0.1,
-      contributions: [],
+      contributions: [{
+        queryOrdinal: 0,
+        sourceRank: index + 1,
+        contribution: 0.1,
+        documentKey: `generated:${sessionId}:0`,
+        seq: "0",
+        snippet: null,
+      }],
     })),
   },
   sessionQuery: {
