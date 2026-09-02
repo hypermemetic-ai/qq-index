@@ -1,6 +1,8 @@
 # Production session-index runtime and daemon
 
-This is the production lifecycle for QQ's derived DSH session-history index. It is separate from the existing `qq-index` README refresh service and timer. It does not grant workspace access or make an index hit authoritative; qq-core remains responsible for authorization and presentation, and exact DSH verification remains required for returned candidates. The injected canonical helpers provide a package-resolution-independent boundary for consumers such as qq-core; this repository change does not by itself claim that qq-core's `/find-session` cutover is complete.
+This documents the current V1 production/rollback lifecycle for QQ's derived DSH session-history index. The approved forward target is the compiled materialized-view V2 proof in [`materialized-view-platform-v1.md`](materialized-view-platform-v1.md); V1 is preserved as a shadow reference oracle and rollback route, not the target hot path. It is separate from the existing `qq-index` README refresh service and timer. It does not grant workspace access or make an index hit authoritative; qq-core remains responsible for authorization and presentation, and exact DSH verification remains required for returned candidates. The injected canonical helpers provide a package-resolution-independent boundary for consumers such as qq-core; this repository change does not by itself claim that qq-core's `/find-session` cutover is complete.
+
+> **Transitional DSH warning:** the current rc.7 grouped-session patch is evidence/rollback support only. The coordinated forward target is released DSH `0.1.2-alpha.4` (`dsh-v0.1.2-alpha.4`, `4e84901e6471b79ec0338099867ebb4606d12bb5`). Do not forward-port the rc.7 patch.
 
 ## Plugin configuration and service contract
 

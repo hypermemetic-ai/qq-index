@@ -10,7 +10,12 @@
     "./session-index-client": "./src/session-index-client.mjs",
     "./session-index-dsh-source": "./src/session-index-dsh-source.mjs",
     "./session-index-runtime": "./src/session-index-runtime.mjs",
-    "./session-index-launcher": "./src/session-index-launcher.mjs"
+    "./session-index-launcher": "./src/session-index-launcher.mjs",
+    "./views/catalog": "./src/views/catalog.mjs",
+    "./views/conversation-v1": "./src/views/conversation-v1.mjs",
+    "./views/registry": "./src/views/registry.mjs",
+    "./dsh-alpha4-view-source": "./src/dsh-alpha4-view-source.mjs",
+    "./session-index-shadow-adapter": "./src/session-index-shadow-adapter.mjs"
   },
   "files": [
     "bin/",
@@ -23,7 +28,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node tests/plugin.mjs && node tests/session-index-runtime.mjs && node tests/session-index-capabilities.mjs && node tests/session-index-verifier-selection.mjs && node tests/session-index-verifier-batch.mjs && node tests/session-index-launcher.mjs && node tests/session-index-dsh-fast-path.mjs && node tests/session-index-dsh-production.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-dsh-e2e && npm run test:session-index-e2e",
+    "test": "node tests/plugin.mjs && node tests/session-index-runtime.mjs && node tests/view-catalog.mjs && node tests/conversation-view-projector.mjs && node tests/dsh-alpha4-view-source.mjs && node tests/session-index-shadow-adapter.mjs && node tests/session-index-capabilities.mjs && node tests/session-index-verifier-selection.mjs && node tests/session-index-verifier-batch.mjs && node tests/session-index-launcher.mjs && node tests/session-index-dsh-fast-path.mjs && node tests/session-index-dsh-production.mjs && node tests/index.mjs && node tests/harvest.mjs && node tests/history-shadow.mjs && node tests/session-history-benchmark.mjs && node tests/writer-boot.mjs && node tests/refresh.mjs && npm run test:session-index-dsh-e2e && npm run test:session-index-e2e",
     "benchmark:session-history": "python3 benchmarks/session_history_fts5.py",
     "benchmark:session-history:scaled": "python3 benchmarks/session_history_fts5.py --mode scaled",
     "rust:fmt": "cargo fmt --check",

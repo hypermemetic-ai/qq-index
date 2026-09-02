@@ -6,6 +6,11 @@ export const SESSION_INDEX_MUTATION_VERSION = "mutation-batch-v1";
 export const SESSION_INDEX_SEARCH_VERSION = "search-batch-v1";
 export const SESSION_INDEX_SOURCE_STATE_VERSION = "source-state-v1";
 export const SESSION_INDEX_CANCEL_VERSION = "cancel-v1";
+export const SESSION_INDEX_VIEW_DESCRIBE_VERSION = "qq-index-view-describe/v1";
+export const SESSION_INDEX_VIEW_MUTATION_VERSION = "qq-index-view-mutation/v1";
+export const SESSION_INDEX_VIEW_LIFECYCLE_VERSION = "qq-index-view-lifecycle/v1";
+export const SESSION_INDEX_VIEW_PARTITION_STATE_VERSION = "qq-index-view-partition-state/v1";
+export const SESSION_INDEX_VIEW_QUERY_VERSION = "qq-index-query/v1";
 export const SESSION_INDEX_MAX_FRAME_BYTES = 1024 * 1024;
 
 const HEALTH_RESPONSE_VERSION = "health-response-v1";
@@ -14,6 +19,8 @@ const SEARCH_RESPONSE_VERSION = "search-batch-response-v1";
 const SHUTDOWN_RESPONSE_VERSION = "shutdown-response-v1";
 const SOURCE_STATE_RESPONSE_VERSION = "source-state-response-v1";
 const CANCEL_RESPONSE_VERSION = "cancel-response-v1";
+const VIEW_DESCRIBE_RESPONSE_VERSION = "qq-index-view-describe-response/v1";
+const VIEW_RESPONSE_VERSION = "qq-index-view-response/v1";
 const SCHEMA_FINGERPRINT = "qq-session-index-schema-v1";
 const PROJECTION_VERSION = "qq-session-projection-v1";
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -38,6 +45,12 @@ const TERMINAL_ERROR_CODES = new Set([
   "watermark_conflict",
   "idempotency_conflict",
   "mutation_conflict",
+  "unsupported_view",
+  "unsupported_access",
+  "view_building",
+  "view_failed",
+  "freshness_unavailable",
+  "authorization_required",
   "storage_error",
 ]);
 
@@ -177,6 +190,61 @@ class SessionIndexClient {
     return this.#enqueue(
       operation,
       (response) => validateSearchResponse(response, wireRequest),
+      options,
+    );
+  }
+
+  describeViews(options = {}) {
+    return this.#enqueue(
+      { type: "describeViews", version: SESSION_INDEX_VIEW_DESCRIBE_VERSION },
+      validateDescribeViewsResponse,
+      options,
+    );
+  }
+
+  viewPartitionState(request, options = {}) {
+    exactObject(request, ["view", "partitionKeys"], [], "view partition state request");
+    validateViewIdentity(request.view);
+    stringList(request.partitionKeys, "partitionKeys", 64, 256);
+    if (request.partitionKeys.length === 0) invalid("partitionKeys must not be empty");
+    if (new Set(request.partitionKeys).size !== request.partitionKeys.length) invalid("partitionKeys must be unique");
+    const detached = structuredClone(request);
+    return this.#enqueue(
+      { type: "viewPartitionState", version: SESSION_INDEX_VIEW_PARTITION_STATE_VERSION, ...detached },
+      (response) => validateViewPartitionStateResponse(response, detached),
+      options,
+    );
+  }
+
+  mutateView(mutation, options = {}) {
+    validateViewMutation(mutation);
+    const detached = structuredClone(mutation);
+    validateViewMutation(detached);
+    return this.#enqueue(
+      { type: "mutateView", version: SESSION_INDEX_VIEW_MUTATION_VERSION, mutation: detached },
+      validateViewReceipt,
+      options,
+    );
+  }
+
+  setViewLifecycle(request, options = {}) {
+    validateViewLifecycle(request);
+    const detached = structuredClone(request);
+    validateViewLifecycle(detached);
+    return this.#enqueue(
+      { type: "setViewLifecycle", version: SESSION_INDEX_VIEW_LIFECYCLE_VERSION, ...detached },
+      validateViewReceipt,
+      options,
+    );
+  }
+
+  execute(request, options = {}) {
+    validateViewExecuteRequest(request);
+    const detached = structuredClone(request);
+    validateViewExecuteRequest(detached);
+    return this.#enqueue(
+      { type: "execute", ...detached },
+      (response) => validateViewQueryResponse(response, detached),
       options,
     );
   }
@@ -780,6 +848,207 @@ function validateFused(fused, index) {
   }
 }
 
+
+function validateViewIdentity(view, name = "view") {
+  exactObject(view, ["id", "version"], [], name);
+  boundedString(view.id, `${name}.id`, 1, 128);
+  boundedInteger(view.version, `${name}.version`, 1, 0xffff_ffff);
+}
+
+function validateViewMutation(mutation) {
+  plainObject(mutation, "view mutation");
+  const common = ["kind", "view", "partitionKey"];
+  if (mutation.kind === "replacePartition") {
+    exactObject(mutation, [...common, "source", "rows"], [], "view mutation");
+    validateViewSource(mutation.source, "view mutation source");
+    boundedArray(mutation.rows, "view mutation rows", 0, MAX_DOCUMENTS);
+    validateJsonPayload(mutation.rows, "view mutation rows");
+  } else if (mutation.kind === "applyDelta") {
+    exactObject(mutation, [...common, "expectedCursor", "source", "upserts", "deletes"], [], "view mutation");
+    unsignedString(mutation.expectedCursor, "expectedCursor", MAX_SQLITE_INTEGER);
+    validateViewSource(mutation.source, "view mutation source");
+    boundedArray(mutation.upserts, "view mutation upserts", 0, MAX_DOCUMENTS);
+    stringList(mutation.deletes, "view mutation deletes", MAX_DOCUMENTS, 256);
+    validateJsonPayload(mutation.upserts, "view mutation upserts");
+  } else if (mutation.kind === "deletePartition") {
+    exactObject(mutation, [...common, "expectedCursor", "sourceIdentity", "sourceFence", "lagMs"], [], "view mutation");
+    unsignedString(mutation.expectedCursor, "expectedCursor", MAX_SQLITE_INTEGER);
+    boundedString(mutation.sourceIdentity, "sourceIdentity", 1, 4_096);
+    boundedString(mutation.sourceFence, "sourceFence", 1, 4_096);
+    nonnegativeSafeInteger(mutation.lagMs, "lagMs");
+  } else {
+    invalid("view mutation kind is unsupported");
+  }
+  validateViewIdentity(mutation.view);
+  boundedString(mutation.partitionKey, "partitionKey", 1, 256);
+}
+
+function validateViewSource(source, name) {
+  exactObject(source, ["sourceIdentity", "durableRevision", "nextCursor", "sourceFence", "lagMs"], [], name);
+  boundedString(source.sourceIdentity, `${name}.sourceIdentity`, 1, 4_096);
+  boundedString(source.durableRevision, `${name}.durableRevision`, 1, 4_096);
+  unsignedString(source.nextCursor, `${name}.nextCursor`, MAX_SQLITE_INTEGER);
+  boundedString(source.sourceFence, `${name}.sourceFence`, 1, 4_096);
+  nonnegativeSafeInteger(source.lagMs, `${name}.lagMs`);
+}
+
+function validateViewLifecycle(request) {
+  exactObject(request, ["view", "state", "sourceFence", "lagMs"], [], "view lifecycle request");
+  validateViewIdentity(request.view);
+  if (!["ready", "building", "failed"].includes(request.state)) invalid("view lifecycle state is unsupported");
+  boundedString(request.sourceFence, "sourceFence", 1, 4_096);
+  nonnegativeSafeInteger(request.lagMs, "lagMs");
+}
+
+function validateViewExecuteRequest(request) {
+  exactObject(request, ["version", "view", "access", "params", "authority", "freshness"], [], "view execute request");
+  equal(request.version, SESSION_INDEX_VIEW_QUERY_VERSION, "view query version");
+  validateViewIdentity(request.view);
+  boundedString(request.access, "view access", 1, 128);
+  plainObject(request.params, "view params");
+  validateJsonPayload(request.params, "view params");
+  exactObject(request.authority, ["kind", "scopeTokens"], [], "view authority");
+  equal(request.authority.kind, "workspace-token-set/v1", "view authority kind");
+  stringList(request.authority.scopeTokens, "scopeTokens", 16, 64);
+  if (request.authority.scopeTokens.length === 0) invalid("scopeTokens must not be empty");
+  for (const token of request.authority.scopeTokens) {
+    if (!/^[a-z0-9]+$/u.test(token)) invalid("scopeTokens must be lowercase ASCII alphanumeric");
+  }
+  exactObject(request.freshness, ["mode", "maxLagMs"], [], "view freshness");
+  equal(request.freshness.mode, "caught-up", "view freshness mode");
+  nonnegativeSafeInteger(request.freshness.maxLagMs, "maxLagMs");
+}
+
+function validateDescribeViewsResponse(response) {
+  exactObject(response, ["type", "version", "views"], [], "describe views response");
+  equal(response.type, "describeViews", "describe views response type");
+  equal(response.version, VIEW_DESCRIBE_RESPONSE_VERSION, "describe views response version");
+  boundedArray(response.views, "described views", 1, 64);
+  for (const [index, entry] of response.views.entries()) validateViewDescription(entry, `views[${index}]`);
+}
+
+function validateViewDescription(entry, name) {
+  exactObject(entry, ["manifest", "state", "snapshot"], [], name);
+  const manifest = entry.manifest;
+  exactObject(manifest, [
+    "id", "version", "digest", "buildId", "sourceContract", "sourceStateVersion",
+    "partitionKey", "rowSchema", "authorizationContract", "physicalSchema",
+    "maximumPartitionRows", "maximumPartitionBytes", "testOnly", "accesses",
+  ], [], `${name}.manifest`);
+  validateViewIdentity({ id: manifest.id, version: manifest.version }, `${name}.manifest identity`);
+  for (const key of ["digest", "buildId", "sourceContract", "sourceStateVersion", "partitionKey", "rowSchema", "authorizationContract", "physicalSchema"]) {
+    boundedString(manifest[key], `${name}.manifest.${key}`, 1, 256);
+  }
+  boundedInteger(manifest.maximumPartitionRows, `${name}.manifest.maximumPartitionRows`, 1, MAX_DOCUMENTS);
+  boundedInteger(manifest.maximumPartitionBytes, `${name}.manifest.maximumPartitionBytes`, 1_024, 900 * 1_024);
+  boolean(manifest.testOnly, `${name}.manifest.testOnly`);
+  boundedArray(manifest.accesses, `${name}.manifest.accesses`, 1, 32);
+  for (const access of manifest.accesses) {
+    exactObject(access, ["name", "maximumResults", "maximumWorkUnits", "authorization"], [], `${name}.manifest.access`);
+    boundedString(access.name, `${name}.manifest.access.name`, 1, 128);
+    boundedInteger(access.maximumResults, `${name}.manifest.access.maximumResults`, 1, 10_000);
+    boundedInteger(access.maximumWorkUnits, `${name}.manifest.access.maximumWorkUnits`, 1, 1_000_000);
+    boundedString(access.authorization, `${name}.manifest.access.authorization`, 1, 128);
+  }
+  validateViewState(entry.state, `${name}.state`);
+  validateViewSnapshot(entry.snapshot, `${name}.snapshot`);
+}
+
+function validateViewPartitionStateResponse(response, request) {
+  exactObject(response, ["type", "version", "view", "buildId", "snapshot", "partitions"], [], "view partition state response");
+  equal(response.type, "viewPartitionState", "view partition state response type");
+  equal(response.version, SESSION_INDEX_VIEW_PARTITION_STATE_VERSION, "view partition state response version");
+  validateViewIdentity(response.view);
+  equal(response.view.id, request.view.id, "partition state view id");
+  equal(response.view.version, request.view.version, "partition state view version");
+  boundedString(response.buildId, "partition state buildId", 1, 256);
+  validateViewSnapshot(response.snapshot, "partition state snapshot");
+  boundedArray(response.partitions, "partition states", 0, request.partitionKeys.length);
+  const requested = new Set(request.partitionKeys);
+  const seen = new Set();
+  for (const partition of response.partitions) {
+    exactObject(partition, ["partitionKey", "sourceIdentity", "durableRevision", "nextCursor", "generation"], [], "partition state");
+    boundedString(partition.partitionKey, "partition state partitionKey", 1, 256);
+    if (!requested.has(partition.partitionKey) || seen.has(partition.partitionKey)) invalid("partition state contains unexpected or duplicate partition", "protocol_violation");
+    seen.add(partition.partitionKey);
+    boundedString(partition.sourceIdentity, "partition state sourceIdentity", 1, 4_096);
+    boundedString(partition.durableRevision, "partition state durableRevision", 1, 4_096);
+    unsignedString(partition.nextCursor, "partition state nextCursor", MAX_SQLITE_INTEGER);
+    unsignedString(partition.generation, "partition state generation", MAX_SQLITE_INTEGER);
+  }
+}
+
+function validateViewReceipt(response) {
+  exactObject(response, [
+    "type", "version", "view", "buildId", "state", "snapshot", "partitionKey",
+    "nextCursor", "affectedRows", "telemetry",
+  ], [], "view mutation response");
+  equal(response.type, "mutateView", "view mutation response type");
+  equal(response.version, VIEW_RESPONSE_VERSION, "view mutation response version");
+  validateViewIdentity(response.view);
+  boundedString(response.buildId, "buildId", 1, 256);
+  validateViewState(response.state, "view state");
+  validateViewSnapshot(response.snapshot, "view snapshot");
+  if (response.partitionKey !== null) boundedString(response.partitionKey, "partitionKey", 1, 256);
+  if (response.nextCursor !== null) unsignedString(response.nextCursor, "nextCursor", MAX_SQLITE_INTEGER);
+  boundedInteger(response.affectedRows, "affectedRows", 0, 2 * MAX_DOCUMENTS);
+  validateViewTelemetry(response.telemetry);
+}
+
+function validateViewQueryResponse(response, request) {
+  exactObject(response, [
+    "type", "version", "view", "buildId", "access", "snapshot", "result", "telemetry",
+  ], [], "view query response");
+  equal(response.type, "execute", "view query response type");
+  equal(response.version, VIEW_RESPONSE_VERSION, "view query response version");
+  validateViewIdentity(response.view);
+  equal(response.view.id, request.view.id, "view response id");
+  equal(response.view.version, request.view.version, "view response version identity");
+  equal(response.access, request.access, "view response access");
+  boundedString(response.buildId, "buildId", 1, 256);
+  validateViewSnapshot(response.snapshot, "view snapshot");
+  plainObject(response.result, "view result");
+  validateJsonPayload(response.result, "view result");
+  validateViewTelemetry(response.telemetry);
+}
+
+function validateViewState(state, name) {
+  if (!["ready", "building", "failed"].includes(state)) invalid(`${name} is unsupported`, "protocol_violation");
+}
+
+function validateViewSnapshot(snapshot, name) {
+  exactObject(snapshot, ["generation", "sourceFence", "lagMs"], [], name);
+  unsignedString(snapshot.generation, `${name}.generation`, MAX_SQLITE_INTEGER);
+  boundedString(snapshot.sourceFence, `${name}.sourceFence`, 1, 4_096);
+  unsignedString(snapshot.lagMs, `${name}.lagMs`, MAX_SQLITE_INTEGER);
+}
+
+function validateViewTelemetry(telemetry) {
+  exactObject(telemetry, ["operation", "outcome", "elapsedMicros", "phasesMicros", "counts"], [], "view telemetry");
+  boundedString(telemetry.operation, "view telemetry operation", 1, 64);
+  if (!["ok", "error"].includes(telemetry.outcome)) invalid("view telemetry outcome is unsupported", "protocol_violation");
+  unsignedString(telemetry.elapsedMicros, "view telemetry elapsedMicros");
+  validateUnsignedMap(telemetry.phasesMicros, "view telemetry phasesMicros");
+  validateUnsignedMap(telemetry.counts, "view telemetry counts");
+}
+
+function validateUnsignedMap(value, name) {
+  plainObject(value, name);
+  if (Object.keys(value).length > 32) invalid(`${name} exceeds field bound`, "protocol_violation");
+  for (const [key, entry] of Object.entries(value)) {
+    identifier(key, `${name} key`);
+    unsignedString(entry, `${name}.${key}`);
+  }
+}
+
+function validateJsonPayload(value, name) {
+  let encoded;
+  try { encoded = JSON.stringify(value); } catch (cause) { invalid(`${name} must be JSON serializable`, "invalid_argument", cause); }
+  if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 900 * 1_024) {
+    invalid(`${name} exceeds JSON payload bound`);
+  }
+}
+
 function validateShutdownResponse(response) {
   exactObject(response, ["type", "version"], [], "shutdown response");
   equal(response.type, "shutdown", "shutdown response type");
@@ -1146,6 +1415,11 @@ function timeout(value, name) {
 
 function finiteNumber(value, name) {
   if (typeof value !== "number" || !Number.isFinite(value)) invalid(`${name} must be finite`);
+}
+
+function nonnegativeSafeInteger(value, name) {
+  safeInteger(value, name);
+  if (value < 0) invalid(`${name} must be nonnegative`);
 }
 
 function boolean(value, name) {

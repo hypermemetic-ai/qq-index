@@ -27,7 +27,11 @@ The declared JavaScript package surface is:
 | `./session-index-client` | [`src/session-index-client.mjs`](src/session-index-client.mjs) |
 | `./session-index-dsh-source` | [`src/session-index-dsh-source.mjs`](src/session-index-dsh-source.mjs) |
 | `./session-index-runtime` | [`src/session-index-runtime.mjs`](src/session-index-runtime.mjs) |
-| `./session-index-launcher` | [`src/session-index-launcher.mjs`](src/session-index-launcher.mjs) |
+| `./dsh-alpha4-view-source` | [`src/dsh-alpha4-view-source.mjs`](src/dsh-alpha4-view-source.mjs) |
+| `./session-index-shadow-adapter` | [`src/session-index-shadow-adapter.mjs`](src/session-index-shadow-adapter.mjs) |
+| `./views/catalog` | [`src/views/catalog.mjs`](src/views/catalog.mjs) |
+| `./views/conversation-v1` | [`src/views/conversation-v1.mjs`](src/views/conversation-v1.mjs) |
+| `./views/registry` | [`src/views/registry.mjs`](src/views/registry.mjs) |
 
 The manifest also declares three executable entry points:
 
@@ -51,9 +55,10 @@ These are navigation pairs supported by declared exports/scripts and matching tr
 | Package plugin | [`src/plugin.mjs`](src/plugin.mjs) | [`tests/plugin.mjs`](tests/plugin.mjs) |
 | Index, harvest, or refresh path | [`src/index.mjs`](src/index.mjs), [`src/harvest.mjs`](src/harvest.mjs), [`src/refresh.mjs`](src/refresh.mjs) | [`tests/index.mjs`](tests/index.mjs), [`tests/harvest.mjs`](tests/harvest.mjs), [`tests/refresh.mjs`](tests/refresh.mjs) |
 | Writer boot or model pass | [`src/writer-boot.mjs`](src/writer-boot.mjs), [`src/model-pass.mjs`](src/model-pass.mjs) | [`tests/writer-boot.mjs`](tests/writer-boot.mjs), [`prompts/writer.md`](prompts/writer.md), [`config/writer.patch.yml`](config/writer.patch.yml) |
-| Session-index JavaScript surface | The four exported `session-index-*` modules above | [`tests/session-index-runtime.mjs`](tests/session-index-runtime.mjs), [`tests/session-index-launcher.mjs`](tests/session-index-launcher.mjs), [`tests/session-index-capabilities.mjs`](tests/session-index-capabilities.mjs), and the two E2E scripts named above |
+| Session-index/view JavaScript surface | The session-index, alpha.4 source, shadow, and typed-view modules above | [`tests/session-index-runtime.mjs`](tests/session-index-runtime.mjs), [`tests/session-index-launcher.mjs`](tests/session-index-launcher.mjs), [`tests/session-index-capabilities.mjs`](tests/session-index-capabilities.mjs), and the two E2E scripts named above |
 | Rust core/search | [`crates/session-index-core/src/lib.rs`](crates/session-index-core/src/lib.rs), [`crates/session-index-core/src/search.rs`](crates/session-index-core/src/search.rs) | [`crates/session-index-core/tests/phase1a.rs`](crates/session-index-core/tests/phase1a.rs), then `npm run rust:test` |
 | Rust daemon/protocol | [`crates/session-indexd/src/server.rs`](crates/session-indexd/src/server.rs), [`crates/session-indexd/src/protocol.rs`](crates/session-indexd/src/protocol.rs) | [`crates/session-indexd/tests/daemon_protocol.rs`](crates/session-indexd/tests/daemon_protocol.rs), then `npm run daemon:test` |
+| Compiled materialized views | [`src/views/catalog.mjs`](src/views/catalog.mjs), [`crates/session-index-core/src/view_platform/`](crates/session-index-core/src/view_platform/mod.rs), [`docs/materialized-view-platform-v1.md`](docs/materialized-view-platform-v1.md) | `node tests/view-catalog.mjs`, `node tests/dsh-alpha4-view-source.mjs`, then Rust workspace tests |
 | History shadow | [`src/history-shadow.mjs`](src/history-shadow.mjs), [`src/history-shadow-cli.mjs`](src/history-shadow-cli.mjs) | [`tests/history-shadow.mjs`](tests/history-shadow.mjs), [`docs/history-shadow-experiment.md`](docs/history-shadow-experiment.md) |
 
 For deeper session-index context, use [`docs/session-history-indexing.md`](docs/session-history-indexing.md) and [`docs/session-index-production.md`](docs/session-index-production.md).

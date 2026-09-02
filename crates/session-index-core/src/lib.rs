@@ -18,6 +18,7 @@ use thiserror::Error;
 
 mod search;
 pub use search::*;
+pub mod view_platform;
 
 /// SQLite application id: ASCII `QSI1`.
 pub const APPLICATION_ID: i32 = 0x5153_4931;

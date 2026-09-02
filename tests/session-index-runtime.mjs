@@ -38,7 +38,7 @@ const inert = createSessionIndexRuntime({}, {
   },
 });
 assert.equal(Object.isFrozen(inert.service), true);
-assert.deepEqual(Object.keys(inert.service).sort(), ["deriveWorkspaceScopeToken", "health", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
+assert.deepEqual(Object.keys(inert.service).sort(), ["capabilities", "deriveWorkspaceScopeToken", "health", "queryView", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
 assert.deepEqual(inert.service.status(), {
   enabled: false,
   phase: "disabled",
@@ -58,6 +58,58 @@ await assert.rejects(inert.service.searchBatch({}), (error) => error.code === "d
 await assert.rejects(inert.service.restart(), (error) => error.code === "disabled");
 await inert.dispose();
 assert.equal(inertCalls, 0, "disabled mode must not create a client/source/timer side effect");
+
+let forbiddenViewSourceCalls = 0;
+let viewExecuteCalls = 0;
+const viewOnlyRuntime = createSessionIndexRuntime({
+  sessionIndex: { enabled: true, socketPath: "/generated/runtime/view-only.sock" },
+}, {
+  async connectClient() {
+    return {
+      async execute(request) {
+        viewExecuteCalls += 1;
+        assert.equal(request.authority.kind, "workspace-token-set/v1");
+        assert.equal(request.authority.scopeTokens.length, 1);
+        assert.equal(JSON.stringify(request).includes("/generated/workspace"), false);
+        return {
+          type: "execute", version: "qq-index-view-response/v1", view: request.view,
+          buildId: "conversation-v1-physical-1", access: request.access,
+          snapshot: { generation: "3", sourceFence: "fence-3", lagMs: "0" },
+          result: {
+            sessions: [{
+              rank: 1, sessionId: "view-session", score: 0.1, matchingLiteralOrdinals: [0],
+              title: "View title", sessionUpdatedAtUnixMs: 2_000,
+              evidence: { rowKey: "view-session:0", seq: "0", eventTimeUnixMs: 1_000,
+                eventType: "message/generated", surface: "current" },
+            }], truncated: false,
+          },
+          telemetry: { operation: "execute", outcome: "ok", elapsedMicros: "9",
+            phasesMicros: { indexedPlan: "7" }, counts: { results: "1" } },
+        };
+      },
+      async close() {},
+    };
+  },
+  createSource() {
+    forbiddenViewSourceCalls += 1;
+    throw new Error("view query touched DSH source");
+  },
+});
+assert.equal(viewOnlyRuntime.service.capabilities().length, 2);
+assert.equal(Object.isFrozen(viewOnlyRuntime.service.capabilities()), true);
+const viewOnlyResult = await viewOnlyRuntime.service.queryView({
+  version: "qq-index-query/v1",
+  view: { id: "qq.session.conversation", version: 1 },
+  access: "literal-session-search",
+  params: { literals: ["generated literal"], limit: 5 },
+  authority: { kind: "workspace-set/v1", workspaceIds: ["/generated/workspace"] },
+  freshness: { mode: "caught-up", maxLagMs: 1_000 },
+});
+assert.equal(viewOnlyResult.result.sessions[0].sessionId, "view-session");
+assert.equal(viewExecuteCalls, 1);
+assert.equal(forbiddenViewSourceCalls, 0, "queryView must perform zero DSH/source calls");
+assert.equal(viewOnlyRuntime.service.status().phase, "waiting-session-query");
+await viewOnlyRuntime.dispose();
 
 const state = {
   daemonUp: true,

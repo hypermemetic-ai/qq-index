@@ -9,6 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use qq_session_index_core::{
     CommitReceipt, IndexError, IndexMetadata, MutationBatch, SearchBatchResponseV1, SearchBatchV1,
     SessionIndex, SessionIndexReader, SourceStateV1,
+    view_platform::{
+        ViewCatalog, ViewDescriptionV1, ViewLifecycleV1, ViewMutationV1, ViewOperationReceiptV1,
+        ViewPartitionStatesV1, ViewQueryResponseV1, ViewQueryV1,
+    },
 };
 use rusqlite::InterruptHandle;
 
@@ -103,6 +107,40 @@ impl SearchControl {
             let _ = completion.send(result);
         }
     }
+
+    /// Publish a connection-specific interrupt handle and become active as one transition.
+    /// The caller must already own the corresponding SQLite connection mutex.
+    fn activate_interrupt(&self, interrupt: Arc<InterruptHandle>) -> bool {
+        let Ok(mut active) = self.active_interrupt.lock() else {
+            return false;
+        };
+        *active = Some(Arc::clone(&interrupt));
+        if self
+            .phase
+            .compare_exchange(
+                PHASE_QUEUED,
+                PHASE_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            *active = None;
+            return false;
+        }
+        // Close the transition race: cancellation sets its flag before observing phase.
+        if self.cancelled.load(Ordering::Acquire) {
+            interrupt.interrupt();
+        }
+        true
+    }
+
+    /// Clear the published handle while the caller still owns its connection mutex.
+    fn clear_interrupt(&self) {
+        if let Ok(mut active) = self.active_interrupt.lock() {
+            *active = None;
+        }
+    }
 }
 
 struct ReaderJob {
@@ -146,6 +184,7 @@ pub(crate) struct Coordinator {
     reader_retirements: Arc<AtomicU64>,
     active_readers: Arc<AtomicU64>,
     peak_active_readers: Arc<AtomicU64>,
+    view_catalog: Mutex<Option<Arc<ViewCatalog>>>,
     #[cfg(test)]
     hooks: Arc<TestHooks>,
 }
@@ -187,6 +226,7 @@ impl Runtime {
             reader_retirements: Arc::clone(&reader_retirements),
             active_readers: Arc::clone(&active_readers),
             peak_active_readers: Arc::clone(&peak_active_readers),
+            view_catalog: Mutex::new(None),
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         });
@@ -249,6 +289,143 @@ impl Runtime {
 }
 
 impl Coordinator {
+    pub(crate) fn install_view_catalog(&self, catalog: ViewCatalog) -> Result<(), ProtocolError> {
+        let mut installed = self.view_catalog.lock().map_err(|_| lock_error())?;
+        if installed.is_some() {
+            return Err(ProtocolError::StorageUnavailable);
+        }
+        *installed = Some(Arc::new(catalog));
+        Ok(())
+    }
+
+    fn view_catalog(&self) -> Result<Arc<ViewCatalog>, ProtocolError> {
+        self.view_catalog
+            .lock()
+            .map_err(|_| lock_error())?
+            .clone()
+            .ok_or(ProtocolError::StorageUnavailable)
+    }
+
+    pub(crate) fn describe_views(
+        &self,
+        deadline: u64,
+    ) -> Result<Vec<ViewDescriptionV1>, ProtocolError> {
+        ensure_deadline(deadline)?;
+        let result = self
+            .view_catalog()?
+            .describe()
+            .map_err(ProtocolError::from)?;
+        ensure_deadline(deadline)?;
+        Ok(result)
+    }
+
+    pub(crate) fn view_partition_states(
+        &self,
+        deadline: u64,
+        view: &qq_session_index_core::view_platform::ViewIdentityV1,
+        partition_keys: &[String],
+    ) -> Result<ViewPartitionStatesV1, ProtocolError> {
+        ensure_deadline(deadline)?;
+        let result = self
+            .view_catalog()?
+            .partition_states(view, partition_keys)
+            .map_err(ProtocolError::from)?;
+        ensure_deadline(deadline)?;
+        Ok(result)
+    }
+
+    pub(crate) fn mutate_view(
+        &self,
+        deadline: u64,
+        mutation: &ViewMutationV1,
+    ) -> Result<ViewOperationReceiptV1, ProtocolError> {
+        ensure_deadline(deadline)?;
+        let result = self
+            .view_catalog()?
+            .apply_mutation(mutation)
+            .map_err(ProtocolError::from)?;
+        ensure_deadline(deadline)?;
+        Ok(result)
+    }
+
+    pub(crate) fn set_view_lifecycle(
+        &self,
+        deadline: u64,
+        lifecycle: &ViewLifecycleV1,
+    ) -> Result<ViewOperationReceiptV1, ProtocolError> {
+        ensure_deadline(deadline)?;
+        let result = self
+            .view_catalog()?
+            .apply_lifecycle(lifecycle)
+            .map_err(ProtocolError::from)?;
+        ensure_deadline(deadline)?;
+        Ok(result)
+    }
+
+    pub(crate) fn query_view(
+        &self,
+        request_id: String,
+        deadline_unix_ms: u64,
+        query: &ViewQueryV1,
+    ) -> Result<ViewQueryResponseV1, ProtocolError> {
+        ensure_deadline(deadline_unix_ms)?;
+        let catalog = self.view_catalog()?;
+        let (completion, _response) = mpsc::sync_channel(1);
+        let control = Arc::new(SearchControl::new(request_id.clone(), completion));
+        {
+            let mut registry = self.registry.lock().map_err(|_| lock_error())?;
+            if registry.contains_key(&request_id) {
+                return Err(ProtocolError::DuplicateRequestId);
+            }
+            if registry.len() >= self.reader_count + self.queue_capacity {
+                return Err(ProtocolError::AdmissionRejected);
+            }
+            registry.insert(request_id.clone(), Arc::clone(&control));
+        }
+
+        let activating_control = Arc::clone(&control);
+        let releasing_control = Arc::clone(&control);
+        #[cfg(test)]
+        let activating_hooks = Arc::clone(&self.hooks);
+        #[cfg(test)]
+        let releasing_hooks = Arc::clone(&self.hooks);
+        #[cfg(test)]
+        let activating_request_id = request_id.clone();
+        #[cfg(test)]
+        let releasing_request_id = request_id;
+        let result = catalog.query_controlled_with_lease(
+            query,
+            Arc::clone(&control.cancelled),
+            deadline_unix_ms,
+            move |interrupt| {
+                let activated = activating_control.activate_interrupt(interrupt);
+                #[cfg(test)]
+                if activated {
+                    activating_hooks.view_phase(&activating_request_id, ViewQueryTestPhase::Active);
+                }
+                activated
+            },
+            move || {
+                releasing_control.clear_interrupt();
+                #[cfg(test)]
+                releasing_hooks.view_phase(&releasing_request_id, ViewQueryTestPhase::Releasing);
+            },
+        );
+        control.phase.store(PHASE_TERMINAL, Ordering::Release);
+        self.remove_control(&control);
+
+        if control.reason.load(Ordering::Acquire) != CANCEL_NONE
+            || now_unix_ms() >= deadline_unix_ms
+            || matches!(
+                result,
+                Err(qq_session_index_core::view_platform::ViewError::Interrupted)
+            )
+        {
+            return Err(control_protocol_error(&control, deadline_unix_ms));
+        }
+        result.map_err(ProtocolError::from)
+    }
+
     pub(crate) fn reader_count(&self) -> usize {
         self.reader_count
     }
@@ -604,6 +781,23 @@ fn lock_error() -> ProtocolError {
     ProtocolError::StorageUnavailable
 }
 
+fn control_protocol_error(control: &SearchControl, deadline_unix_ms: u64) -> ProtocolError {
+    match control.reason.load(Ordering::Acquire) {
+        CANCEL_DEADLINE => ProtocolError::DeadlineExceeded,
+        CANCEL_CALLER | CANCEL_DISCONNECT => ProtocolError::Cancelled,
+        _ if now_unix_ms() >= deadline_unix_ms => ProtocolError::DeadlineExceeded,
+        _ => ProtocolError::Cancelled,
+    }
+}
+
+fn ensure_deadline(deadline_unix_ms: u64) -> Result<(), ProtocolError> {
+    if now_unix_ms() >= deadline_unix_ms {
+        Err(ProtocolError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 fn duration_until(deadline_unix_ms: u64) -> Duration {
     Duration::from_millis(deadline_unix_ms.saturating_sub(now_unix_ms()))
 }
@@ -621,11 +815,22 @@ pub(crate) fn now_unix_ms() -> u64 {
 type ReaderHook = Arc<dyn Fn(usize, &str) + Send + Sync>;
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewQueryTestPhase {
+    Active,
+    Releasing,
+}
+
+#[cfg(test)]
+type ViewQueryHook = Arc<dyn Fn(&str, ViewQueryTestPhase) + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
     before: Mutex<Option<ReaderHook>>,
     progress: Mutex<Option<ReaderHook>>,
     force_retire: Mutex<Vec<String>>,
+    view_query: Mutex<Option<ViewQueryHook>>,
 }
 
 #[cfg(test)]
@@ -639,6 +844,13 @@ impl TestHooks {
 
     fn progress_hook(&self) -> Option<ReaderHook> {
         self.progress.lock().ok().and_then(|hook| hook.clone())
+    }
+
+    fn view_phase(&self, request_id: &str, phase: ViewQueryTestPhase) {
+        let hook = self.view_query.lock().ok().and_then(|hook| hook.clone());
+        if let Some(hook) = hook {
+            hook(request_id, phase);
+        }
     }
 
     fn take_forced_retirement(&self, request_id: &str) -> bool {
@@ -671,6 +883,30 @@ impl Coordinator {
         *self.hooks.progress.lock().expect("progress hook lock") = None;
     }
 
+    fn test_set_view_query_hook(&self, hook: ViewQueryHook) {
+        *self.hooks.view_query.lock().expect("view query hook lock") = Some(hook);
+    }
+
+    fn test_clear_view_query_hook(&self) {
+        *self.hooks.view_query.lock().expect("view query hook lock") = None;
+    }
+
+    fn test_control_state(&self, request_id: &str) -> Option<(u8, bool)> {
+        let control = self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .get(request_id)
+            .cloned()?;
+        let phase = control.phase.load(Ordering::Acquire);
+        let has_interrupt = control
+            .active_interrupt
+            .lock()
+            .expect("active interrupt lock")
+            .is_some();
+        Some((phase, has_interrupt))
+    }
+
     fn test_force_retirement(&self, request_id: &str) {
         self.hooks
             .force_retire
@@ -690,7 +926,14 @@ mod tests {
     use std::sync::{Barrier, Condvar};
     use std::time::Instant;
 
-    use qq_session_index_core::{ProjectedDocument, SearchFiltersV1};
+    use qq_session_index_core::{
+        ProjectedDocument, SearchFiltersV1,
+        view_platform::{
+            ViewAuthorityV1, ViewFreshnessV1, ViewIdentityV1, ViewLifecycleV1, ViewMutationV1,
+            ViewSourceCheckpointV1,
+        },
+    };
+    use serde_json::json;
 
     use super::*;
 
@@ -836,6 +1079,179 @@ mod tests {
         wake.notify_all();
         assert!(active.join().expect("join active").is_ok());
         coordinator.test_clear_before_search();
+        drop(coordinator);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn view_mutex_lease_keeps_waiters_queued_and_out_of_legacy_reader_metrics() {
+        const TOKEN: &str = "waaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_root, path, writer) = fixture();
+        let catalog = ViewCatalog::create(&path).expect("create generated view catalog");
+        let exact = ViewIdentityV1 {
+            id: "qq.test.exact-range".to_owned(),
+            version: 1,
+        };
+        catalog
+            .apply_mutation(&ViewMutationV1::ReplacePartition {
+                view: exact.clone(),
+                partition_key: "lease-bucket".to_owned(),
+                source: ViewSourceCheckpointV1 {
+                    source_identity: "lease-source".to_owned(),
+                    durable_revision: "lease-revision-1".to_owned(),
+                    next_cursor: 1,
+                    source_fence: "lease-fence-1".to_owned(),
+                    lag_ms: 0,
+                },
+                rows: vec![json!({
+                    "rowKey":"lease-row", "exactKey":"status", "ordinal":1,
+                    "workspaceScopeToken":TOKEN, "value":"ready"
+                })],
+            })
+            .expect("seed exact view for lease test");
+        catalog
+            .apply_lifecycle(&ViewLifecycleV1::Activate {
+                view: exact.clone(),
+                source_fence: "lease-live".to_owned(),
+                lag_ms: 0,
+            })
+            .expect("activate exact view for lease test");
+
+        let runtime = Runtime::start(writer, &path, 2, 2).expect("start view lease runtime");
+        let coordinator = runtime.coordinator();
+        coordinator
+            .install_view_catalog(catalog)
+            .expect("install view lease catalog");
+        let query = ViewQueryV1 {
+            view: exact,
+            access: "exact-range".to_owned(),
+            params: json!({"exactKey":"status", "minimum":0, "maximum":10, "limit":10}),
+            authority: ViewAuthorityV1 {
+                kind: "workspace-token-set/v1".to_owned(),
+                scope_tokens: vec![TOKEN.to_owned()],
+            },
+            freshness: ViewFreshnessV1 {
+                mode: "caught-up".to_owned(),
+                max_lag_ms: 0,
+            },
+        };
+
+        let (owner_entered_tx, owner_entered_rx) = mpsc::sync_channel(1);
+        let owner_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let weak_coordinator = Arc::downgrade(&coordinator);
+        coordinator.test_set_view_query_hook(Arc::new({
+            let owner_gate = Arc::clone(&owner_gate);
+            let observations = Arc::clone(&observations);
+            move |request_id, phase| {
+                let state = weak_coordinator
+                    .upgrade()
+                    .and_then(|coordinator| coordinator.test_control_state(request_id))
+                    .expect("control remains registered during lease callback");
+                observations.lock().expect("lease observations lock").push((
+                    request_id.to_owned(),
+                    phase,
+                    state,
+                ));
+                if request_id == "view-owner" && phase == ViewQueryTestPhase::Active {
+                    owner_entered_tx
+                        .send(())
+                        .expect("announce owner acquired view mutex");
+                    let (open, wake) = &*owner_gate;
+                    let mut open = open.lock().expect("owner gate lock");
+                    while !*open {
+                        open = wake.wait(open).expect("owner gate wait");
+                    }
+                }
+            }
+        }));
+
+        let owner = {
+            let coordinator = Arc::clone(&coordinator);
+            let query = query.clone();
+            thread::spawn(move || {
+                coordinator.query_view("view-owner".to_owned(), now_unix_ms() + 5_000, &query)
+            })
+        };
+        owner_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner activated while holding view mutex");
+        assert_eq!(
+            coordinator.test_control_state("view-owner"),
+            Some((PHASE_ACTIVE, true)),
+            "active owner must publish its matching interrupt handle",
+        );
+        assert_eq!(coordinator.reader_count(), 2);
+        assert_eq!(
+            coordinator.active_readers(),
+            0,
+            "V2 view owner must not consume a legacy reader slot",
+        );
+        assert_eq!(
+            coordinator.peak_active_readers(),
+            0,
+            "V2 view activity must not change legacy peak reader telemetry",
+        );
+
+        let waiter = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                coordinator.query_view("view-waiter".to_owned(), now_unix_ms() + 5_000, &query)
+            })
+        };
+        let wait_started = Instant::now();
+        loop {
+            if coordinator.test_control_state("view-waiter") == Some((PHASE_QUEUED, false)) {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "waiter never remained queued without an interrupt handle",
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            coordinator
+                .cancel("view-waiter", CancelReason::Caller)
+                .expect("cancel queued view waiter"),
+            CancelOutcome::Queued,
+        );
+        assert!(matches!(
+            waiter.join().expect("join cancelled view waiter"),
+            Err(ProtocolError::Cancelled)
+        ));
+        assert_eq!(
+            coordinator.test_control_state("view-owner"),
+            Some((PHASE_ACTIVE, true)),
+            "cancelling queued B must not clear or interrupt active A",
+        );
+
+        let (open, wake) = &*owner_gate;
+        *open.lock().expect("owner gate lock") = true;
+        wake.notify_all();
+        assert!(owner.join().expect("join unaffected view owner").is_ok());
+        coordinator.test_clear_view_query_hook();
+
+        let observations = observations.lock().expect("lease observations lock");
+        assert!(observations.contains(&(
+            "view-owner".to_owned(),
+            ViewQueryTestPhase::Active,
+            (PHASE_ACTIVE, true),
+        )));
+        assert!(observations.contains(&(
+            "view-owner".to_owned(),
+            ViewQueryTestPhase::Releasing,
+            (PHASE_ACTIVE, false),
+        )));
+        assert!(
+            observations
+                .iter()
+                .all(|(request_id, _, _)| request_id != "view-waiter"),
+            "a cancelled queued waiter must never acquire or publish the owner's handle",
+        );
+        drop(observations);
+        assert_eq!(coordinator.active_readers(), 0);
+        assert_eq!(coordinator.peak_active_readers(), 0);
         drop(coordinator);
         runtime.shutdown();
     }

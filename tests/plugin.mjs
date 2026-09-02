@@ -36,7 +36,7 @@ assert.deepEqual(Object.keys(indexService).sort(), ["loadIndex", "validateIndex"
 assert.equal(indexService.loadIndex, plugin.loadIndex);
 assert.equal(indexService.validateIndex, plugin.validateIndex);
 assert.equal(Object.isFrozen(sessionService), true);
-assert.deepEqual(Object.keys(sessionService).sort(), ["deriveWorkspaceScopeToken", "health", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
+assert.deepEqual(Object.keys(sessionService).sort(), ["capabilities", "deriveWorkspaceScopeToken", "health", "queryView", "ready", "restart", "searchBatch", "status", "verifyDshSearchCandidates"]);
 assert.equal(sessionService.deriveWorkspaceScopeToken, deriveWorkspaceScopeToken);
 assert.equal(sessionService.verifyDshSearchCandidates, verifyDshSearchCandidates);
 assert.equal(sessionService.ready(), false);

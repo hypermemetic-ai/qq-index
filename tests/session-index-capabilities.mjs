@@ -10,8 +10,10 @@ const runtime = createSessionIndexRuntime();
 const service = runtime.service;
 assert.equal(Object.isFrozen(service), true);
 assert.deepEqual(Object.keys(service).sort(), [
+  "capabilities",
   "deriveWorkspaceScopeToken",
   "health",
+  "queryView",
   "ready",
   "restart",
   "searchBatch",

@@ -6,6 +6,7 @@ import {
   loadIndex,
   validateIndex,
 } from "./index.mjs";
+import { compiledViewCapabilities } from "./views/catalog.mjs";
 import {
   SessionIndexRuntimeError,
   createSessionIndexRuntime,
@@ -22,6 +23,7 @@ export {
   SessionIndexRuntimeError,
   createSessionIndexRuntime,
   validateSessionIndexConfig,
+  compiledViewCapabilities,
 };
 
 export const name = "qq-index";
