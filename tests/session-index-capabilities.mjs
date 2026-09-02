@@ -198,11 +198,13 @@ function verificationOptions(searchResponse) {
 }
 
 function responseFor(sessionIds, { duplicateFirst = false } = {}) {
-  const ranked = sessionIds.map((sessionId) => ({
+  const ranked = sessionIds.map((sessionId, index) => ({
+    rank: index + 1,
     sessionId,
     evidence: pointer(sessionId),
   }));
   if (duplicateFirst && ranked.length > 0) ranked.splice(1, 0, structuredClone(ranked[0]));
+  for (const [index, hit] of ranked.entries()) hit.rank = index + 1;
   const sourceRanks = new Map();
   for (const [index, hit] of ranked.entries()) {
     const ranks = sourceRanks.get(hit.sessionId) ?? [];
