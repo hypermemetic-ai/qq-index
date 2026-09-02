@@ -7,6 +7,7 @@ await isolatedFailures();
 await malformedResponses();
 await groupedCancellation();
 await boundedOutput();
+await authoritativeEventTimeIdentity();
 await completeCandidatesOnly();
 await overBoundChunking();
 await productionCallCount();
@@ -233,6 +234,75 @@ async function boundedOutput() {
   assert.equal(clippedEnd.verifiedEvidence[0].snippet.endsWith("…"), false);
 }
 
+async function authoritativeEventTimeIdentity() {
+  const stale = { ...pointer("stale-time", "0"), eventTimeUnixMs: 1_699_999_999_999 };
+  const missing = pointer("missing-time", "0");
+  delete missing.eventTimeUnixMs;
+  const nonSafe = { ...pointer("non-safe-time", "0"), eventTimeUnixMs: Number.MAX_SAFE_INTEGER + 1 };
+  const valid = pointer("valid-time", "0");
+  const partialValid = pointer("partial-time", "0");
+  const partialStale = { ...pointer("partial-time", "1"), eventTimeUnixMs: 1_700_000_000_001 };
+  const duplicateValid = pointer("duplicate-time", "0");
+  const duplicateStale = { ...pointer("duplicate-time", "0"), eventTimeUnixMs: 1_700_000_000_001 };
+  const pointers = [
+    stale,
+    missing,
+    nonSafe,
+    valid,
+    partialValid,
+    partialStale,
+    duplicateValid,
+    duplicateStale,
+  ];
+  const result = await verifyDshSearchCandidates({
+    ...options({
+      sources: [{
+        queryOrdinal: 0,
+        ranked: pointers.map((evidence, index) => ranked(index + 1, evidence)),
+      }],
+      fused: [
+        fused("stale-time", 1, [contribution(0, 1, stale)]),
+        fused("missing-time", 2, [contribution(0, 2, missing)]),
+        fused("non-safe-time", 3, [contribution(0, 3, nonSafe)]),
+        fused("valid-time", 4, [contribution(0, 4, valid)]),
+        fused("partial-time", 5, [
+          contribution(0, 5, partialValid),
+          contribution(0, 6, partialStale),
+        ]),
+        fused("duplicate-time", 6, [
+          contribution(0, 7, duplicateValid),
+          contribution(0, 8, duplicateStale),
+        ]),
+      ],
+    }),
+    sessionQuery: {
+      async readEventDocumentSnapshots(requests) {
+        return fulfilled(requests, new Map(requests.flatMap(({ sessionId, seqs }) => seqs.map((seq) => [
+          `${sessionId}:${seq}`,
+          document(sessionId, seq, "canonical literal"),
+        ]))));
+      },
+    },
+  });
+
+  assert.deepEqual(
+    result.verifiedCandidates.map(({ sessionId }) => sessionId),
+    ["valid-time"],
+    "stale, missing, and non-safe pointer times omit their candidates while an unaffected peer continues",
+  );
+  assert.deepEqual(
+    result.verifiedCandidates.flatMap(({ evidence }) => evidence.map(({ sessionId, seq }) => [sessionId, seq])),
+    [["valid-time", "0"]],
+    "failed contributions and same-coordinate/partial candidate evidence must not be returned",
+  );
+  assert.deepEqual(
+    result.verifiedEvidence.map(({ sessionId, seq }) => [sessionId, seq]),
+    [["valid-time", "0"]],
+    "failed contributions must not leave orphan top-level evidence",
+  );
+  assert.equal(result.verifiedEvidence[0].eventTimeUnixMs, 1_700_000_000_000);
+}
+
 async function completeCandidatesOnly() {
   const first = pointer("partial", "0");
   const second = pointer("partial", "1");
@@ -365,7 +435,7 @@ function responseFor(sessionIds) {
     fused(sessionId, index + 1, [contribution(0, index + 1, hits[index].evidence)])) };
 }
 function pointer(sessionId, seq) {
-  return { sessionId, documentKey: `generated:${sessionId}:${seq}`, seq, eventTimeUnixMs: 7, eventType: "user/message", surface: "current", snippet: null };
+  return { sessionId, documentKey: `generated:${sessionId}:${seq}`, seq, eventTimeUnixMs: 1_700_000_000_000, eventType: "user/message", surface: "current", snippet: null };
 }
 function ranked(rank, evidence) { return { rank, sessionId: evidence.sessionId, score: 1 / rank, evidence }; }
 function contribution(queryOrdinal, sourceRank, evidence) {

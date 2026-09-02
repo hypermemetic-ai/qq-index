@@ -141,6 +141,7 @@ const verification = await verifyDshSearchCandidates({
         evidence: {
           sessionId,
           seq: "0",
+          eventTimeUnixMs: 1,
           eventType: "user/message",
           surface: "current",
           documentKey: `generated:${sessionId}:0`,
